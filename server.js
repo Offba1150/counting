@@ -17,6 +17,12 @@ if (!config.channelAccessToken || !config.channelSecret) {
 const client = new line.Client(config);
 const app = express();
 
+// log ทุก request ที่เข้ามา ไว้ช่วย debug (ดูได้จากแท็บ Logs บน Render)
+app.use((req, res, next) => {
+  console.log(`[incoming] ${req.method} ${req.originalUrl}`);
+  next();
+});
+
 const DB_PATH = path.join(__dirname, 'data', 'scores.json');
 
 function loadDB() {
@@ -79,15 +85,22 @@ function formatBoard(list) {
 // --- LINE webhook -----------------------------------------------------
 // line.middleware verifies the signature and parses the body itself,
 // so no extra body-parser is used on this route.
-app.use('/webhook', line.middleware(config));
-
-app.post('/webhook', (req, res) => {
-  res.status(200).end(); // ack LINE immediately
-  const events = req.body.events || [];
-  events.forEach((event) => {
-    handleEvent(event).catch((err) => console.error('handleEvent error:', err));
-  });
-});
+app.post(
+  '/webhook',
+  line.middleware(config),
+  (req, res) => {
+    res.status(200).end(); // ack LINE immediately
+    const events = req.body.events || [];
+    events.forEach((event) => {
+      handleEvent(event).catch((err) => console.error('handleEvent error:', err));
+    });
+  },
+  // error handler เฉพาะเส้นทางนี้ - จับ error จาก line.middleware เช่น signature ไม่ตรง
+  (err, req, res, next) => {
+    console.error('[webhook error]', err.name, err.message);
+    res.status(err.statusCode || 500).end();
+  }
+);
 
 async function reply(event, text) {
   try {
@@ -242,6 +255,12 @@ app.get('/api/scores', (req, res) => {
 
 app.use(express.static(path.join(__dirname, 'public')));
 app.get('/', (req, res) => res.redirect('/dashboard.html'));
+
+// จับ route ที่ไม่ match อะไรเลย เพื่อ debug ผ่าน Logs
+app.use((req, res) => {
+  console.log(`[404] ${req.method} ${req.originalUrl}`);
+  res.status(404).send('Not Found');
+});
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log('LINE quiz scoreboard bot listening on port ' + PORT));
