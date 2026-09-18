@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="UTF-8" />
+<title>กระดานคะแนนเกมทายคำถาม</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  :root {
+    --bg: #0f172a;
+    --card: #1e293b;
+    --accent: #38bdf8;
+    --gold: #fbbf24;
+    --silver: #cbd5e1;
+    --bronze: #f59e0b;
+    --text: #e2e8f0;
+    --muted: #94a3b8;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: "Sarabun", "Segoe UI", sans-serif;
+    background: linear-gradient(160deg, #0f172a, #1e1b4b);
+    color: var(--text);
+    min-height: 100vh;
+    padding: 24px 16px;
+  }
+  h1 {
+    text-align: center;
+    font-size: clamp(22px, 4vw, 34px);
+    margin: 0 0 4px;
+  }
+  .status {
+    text-align: center;
+    color: var(--muted);
+    margin-bottom: 24px;
+    font-size: 15px;
+  }
+  .badge {
+    display: inline-block;
+    padding: 2px 10px;
+    border-radius: 999px;
+    font-size: 13px;
+    margin-left: 6px;
+  }
+  .badge.active { background: #14532d; color: #86efac; }
+  .badge.inactive { background: #450a0a; color: #fca5a5; }
+  table {
+    width: 100%;
+    max-width: 640px;
+    margin: 0 auto;
+    border-collapse: collapse;
+    background: var(--card);
+    border-radius: 14px;
+    overflow: hidden;
+    box-shadow: 0 10px 30px rgba(0,0,0,0.35);
+  }
+  th, td {
+    padding: 14px 18px;
+    text-align: left;
+  }
+  thead th {
+    background: rgba(56, 189, 248, 0.12);
+    color: var(--accent);
+    font-size: 14px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+  tbody tr:nth-child(odd) { background: rgba(255,255,255,0.02); }
+  tbody tr:hover { background: rgba(56, 189, 248, 0.08); }
+  .rank { width: 40px; font-weight: 700; color: var(--muted); }
+  .rank.r1 { color: var(--gold); }
+  .rank.r2 { color: var(--silver); }
+  .rank.r3 { color: var(--bronze); }
+  .name { font-weight: 600; }
+  .score { text-align: right; font-weight: 700; color: var(--accent); }
+  .empty {
+    text-align: center;
+    color: var(--muted);
+    padding: 40px;
+  }
+  footer {
+    text-align: center;
+    color: var(--muted);
+    font-size: 12px;
+    margin-top: 20px;
+  }
+</style>
+</head>
+<body>
+  <h1>🏆 กระดานคะแนนเกมทายคำถาม</h1>
+  <div class="status" id="status">กำลังโหลด...</div>
+  <table>
+    <thead>
+      <tr>
+        <th class="rank">#</th>
+        <th>ชื่อ</th>
+        <th class="score">คะแนน</th>
+      </tr>
+    </thead>
+    <tbody id="rows"></tbody>
+  </table>
+  <footer>อัปเดตอัตโนมัติทุก 3 วินาที</footer>
+
+<script>
+async function refresh() {
+  try {
+    const res = await fetch('/api/scores', { cache: 'no-store' });
+    const data = await res.json();
+    const statusEl = document.getElementById('status');
+    const badge = data.active
+      ? '<span class="badge active">กำลังเล่น</span>'
+      : '<span class="badge inactive">ยังไม่เริ่ม/จบแล้ว</span>';
+    statusEl.innerHTML = `ข้อที่กำลังเล่น: <b>${data.currentQuestion || '-'}</b> ${badge} · ตอบแล้ว ${data.respondingNow || 0} คน`;
+
+    const rowsEl = document.getElementById('rows');
+    if (!data.players.length) {
+      rowsEl.innerHTML = '<tr><td colspan="3" class="empty">ยังไม่มีคะแนน</td></tr>';
+      return;
+    }
+    rowsEl.innerHTML = data.players.map((p, i) => {
+      const rankClass = i === 0 ? 'r1' : i === 1 ? 'r2' : i === 2 ? 'r3' : '';
+      return `<tr>
+        <td class="rank ${rankClass}">${i + 1}</td>
+        <td class="name">${escapeHtml(p.name)}</td>
+        <td class="score">${p.score}</td>
+      </tr>`;
+    }).join('');
+  } catch (e) {
+    document.getElementById('status').textContent = 'เชื่อมต่อไม่ได้ กำลังลองใหม่...';
+  }
+}
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c]));
+}
+refresh();
+setInterval(refresh, 3000);
+</script>
+</body>
+</html>
