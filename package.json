@@ -1,7 +1,7 @@
 {
   "name": "line-quiz-scoreboard-bot",
   "version": "1.0.0",
-  "description": "LINE group bot that tallies quiz-game scores from A/B/C/D answers and shows a live web dashboard",
+  "description": "LINE group bot: quiz-game scoring, Thai food-menu randomizer, and customer/audit status lookup from an uploaded Excel tracker",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
@@ -12,6 +12,8 @@
   "dependencies": {
     "@line/bot-sdk": "^8.0.0",
     "dotenv": "^16.4.5",
-    "express": "^4.19.2"
+    "exceljs": "^4.4.0",
+    "express": "^4.19.2",
+    "multer": "^1.4.5-lts.1"
   }
 }
