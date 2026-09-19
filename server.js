@@ -139,6 +139,22 @@ function formatDate(d) {
   return `${dd}/${mm}/${yyyy}`;
 }
 
+// ดึงค่าวันที่แบบ raw (ไม่ format) ไว้เทียบว่ารอบไหนใหม่กว่ากัน - คืนค่าเป็น timestamp (ms) หรือ null
+function cellDate(row, col) {
+  const v = row.getCell(col).value;
+  if (v instanceof Date) return v.getTime();
+  if (v && typeof v === 'object' && v.result instanceof Date) return v.result.getTime();
+  return null;
+}
+
+// เช็คว่าข้อความสถานะถือว่า "เสร็จแล้ว" หรือยัง - นับทั้งคำว่า "done" (ไม่สนตัวพิมพ์เล็ก/ใหญ่) และ "ผ่าน"
+// (ชีต SU ใช้คำว่า "ผ่าน" แทนคำว่า Done เช่น "5.ผ่าน SU1", "ผ่าน SU2(2)")
+function isDoneStatus(status) {
+  if (!status) return false;
+  const s = status.toLowerCase();
+  return s.includes('done') || s.includes('ผ่าน');
+}
+
 // โครงสร้างคอลัมน์ยึดตามไฟล์ "Customers Status" ต้นฉบับ (header แถวที่ 2, ข้อมูลเริ่มแถวที่ 3)
 async function loadWorkbook(filePath) {
   const workbook = new ExcelJS.Workbook();
@@ -155,8 +171,10 @@ async function loadWorkbook(filePath) {
         companyName,
         system: cellStr(row, 3),
         contractNo: cellStr(row, 6),
+        submittedAt: cellDate(row, 4), // วันที่ยื่นเอกสารขึ้นทะเบียน
         status: cellStr(row, 26),
         cerIssueDate: cellStr(row, 27),
+        cerExpireDate: cellStr(row, 28),
         cerNo: cellStr(row, 29),
       });
     }
@@ -173,7 +191,11 @@ async function loadWorkbook(filePath) {
         companyName,
         system: cellStr(row, 3),
         su1Status: cellStr(row, 15),
+        su1CertDate: cellStr(row, 13), // Cer. SU1 Date
+        su1SentPlan: cellDate(row, 7), // Sent Plan SU1 Date
         su2Status: cellStr(row, 27),
+        su2CertDate: cellStr(row, 25), // Cer. SU2 Date
+        su2SentPlan: cellDate(row, 17), // Sent Plan SU2 Date
       });
     }
   }
@@ -189,6 +211,7 @@ async function loadWorkbook(filePath) {
         companyName,
         system: cellStr(row, 3),
         certExpireDate: cellStr(row, 4),
+        submittedAt: cellDate(row, 7), // วันที่ยื่นขึ้นทะเบียนกับจีน
         status: cellStr(row, 18),
         cerIssueDate: cellStr(row, 19),
         cerNo: cellStr(row, 20),
@@ -209,13 +232,30 @@ if (fs.existsSync(XLSX_PATH)) {
   reloadCustomerDB().catch((e) => console.error('โหลดไฟล์ Excel เดิมไม่สำเร็จ:', e.message));
 }
 
+// คำทั่วไปที่บ่งบอกแค่ "ประเภทนิติบุคคล" ไม่ใช่ชื่อเฉพาะของบริษัท - ตัดออกจากการค้นหาเสมอ (ทั้งจากคำค้นหาและชื่อบริษัทที่เทียบด้วย)
+// เพราะบริษัทเกือบทุกชื่อมีคำพวกนี้ต่อท้าย ถ้าไม่ตัดออก พิมพ์แค่ "Co., Ltd." คำเดียวก็จะเจอทุกบริษัทเลย
+const GENERIC_SUFFIX_WORDS = new Set([
+  'co', 'ltd', 'limited', 'company', 'corp', 'corporation', 'inc', 'plc',
+  'จำกัด', 'บริษัท', 'มหาชน',
+]);
+
+// ตัดจุด/คอมมา/โคลอน/ขีดกลางออก เพื่อให้ค้นหาแบบไม่สนใจเครื่องหมายวรรคตอนได้
+// เช่น พิมพ์ "QTT" ก็เจอ "Q.T.T. Co., Ltd." เพราะทั้งคู่ normalize เหลือแค่ "qtt" (ตัดคำว่า co/ltd ออกไปแล้ว)
 function norm(s) {
-  return (s || '').toLowerCase().replace(/\s+/g, ' ').trim();
+  const base = (s || '')
+    .toLowerCase()
+    .replace(/[.,:\-]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const words = base.split(' ').filter((w) => w && !GENERIC_SUFFIX_WORDS.has(w));
+  return words.join(' ').trim();
 }
 
-// ค้นหาชื่อบริษัทแบบ substring (ไม่สนตัวพิมพ์เล็ก/ใหญ่) จากทั้ง 3 ชีตพร้อมกัน
+// ค้นหาชื่อบริษัทแบบ substring (ไม่สนตัวพิมพ์เล็ก/ใหญ่ ไม่สนเครื่องหมายวรรคตอน) จากทั้ง 3 ชีตพร้อมกัน
+// ไม่ต้องพิมพ์ชื่อเต็ม แค่พิมพ์บางส่วน (คำแรก, ไม่กี่ตัวอักษร ฯลฯ) ที่ตรงกับส่วนใดส่วนหนึ่งของชื่อก็เจอ
 function searchCompanies(query) {
   const q = norm(query);
+  if (!q) return []; // คำค้นหาเป็นแค่คำทั่วไป (เช่น "Co., Ltd." ล้วนๆ) ไม่มีส่วนที่เจาะจงเหลืออยู่เลย ไม่ถือว่าเจอ
   const results = [];
   for (const rec of DB.initial) if (norm(rec.companyName).includes(q)) results.push({ type: 'initial', rec });
   for (const rec of DB.su) if (norm(rec.companyName).includes(q)) results.push({ type: 'su', rec });
@@ -223,33 +263,199 @@ function searchCompanies(query) {
   return results;
 }
 
-function formatCustomerResult({ type, rec }) {
+// นับจำนวนวันตั้งแต่วันที่ที่กำหนด จนถึงวันนี้ (นับเป็นจำนวนเต็มวัน ไม่สนเวลาในวัน) - คืน null ถ้าไม่มีวันที่
+function daysSince(fromMs) {
+  if (fromMs === null || fromMs === undefined) return null;
+  const from = new Date(fromMs);
+  const fromMidnight = new Date(from.getFullYear(), from.getMonth(), from.getDate()).getTime();
+  const now = new Date();
+  const nowMidnight = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+  return Math.round((nowMidnight - fromMidnight) / 86400000);
+}
+
+// คืนข้อความสถานะ "ที่กำลังดำเนินการอยู่" ของ record เดียว - ถ้าเสร็จ(Done)หมดแล้วคืน null (ไม่ต้องโชว์)
+// ไม่บอกชื่อชีต (Initial/SU/Recer) ที่หัวข้อ แต่จะแปะ (Initial)/(Recer) ต่อท้ายสถานะจริงแทน เพื่อบอกว่าสถานะนี้มาจากรอบไหน
+// latestRound (ถ้ามี) คือรอบล่าสุดที่มีวันที่บันทึกไว้ของบริษัทนี้ (นับรวม SU ด้วย) - { dateStr, label: 'Initial'|'SU1'|'SU2'|'Recer' }
+//   ใช้สำหรับข้อความสถานะ "เสร็จสิ้นรอบ(X)" เท่านั้น
+// certStart (ถ้ามี) คือวันที่ "ใบรับรองฉบับปัจจุบันเริ่มมีผล" - ดูจาก Initial/Recer เท่านั้น (ไม่รวม SU เพราะ SU ไม่ได้ออกใบรับรองใหม่)
+// certExpire (ถ้ามี) คือวันที่ "ใบรับรองฉบับปัจจุบันหมดอายุ" - คู่กับ certStart เดียวกัน (ดูจาก Initial/Recer เท่านั้น)
+//   ทั้งสองค่านี้โชว์ทุก sheet ยกเว้น Initial (เพราะรอบ Initial ยังไม่เคยได้ใบ cer มาก่อน จึงไม่มีข้อมูลใบเดิม)
+function formatInProgress({ type, rec }, latestRound, certStart, certExpire) {
   if (type === 'initial') {
-    const lines = [
-      `🆕 ${rec.companyName} (ขึ้นทะเบียนใหม่ - Initial)`,
-      `ระบบ: ${rec.system || '-'}`,
-      `สถานะ: ${rec.status || '(ยังไม่ระบุ)'}`,
-    ];
-    if (rec.cerNo) lines.push(`เลขที่ใบรับรอง: ${rec.cerNo}`);
-    if (rec.cerIssueDate) lines.push(`วันออกใบรับรอง: ${rec.cerIssueDate}`);
+    if (isDoneStatus(rec.status)) return null;
+    const statusText = rec.status ? `${rec.status}(Initial)` : '(ยังไม่ระบุ)';
+    const lines = [`🆕 ${rec.companyName}`, `ระบบ: ${rec.system || '-'}`, `สถานะ: ${statusText}`];
+    // ระยะเวลาดำเนินการ: นับเฉพาะตอนที่ Status มีการลงข้อมูลแล้ว (ไม่ใช่ช่องว่าง) - นับจากวันที่ยื่นเอกสารขึ้นทะเบียน ถึงวันนี้
+    // ถ้าช่องวันที่ตั้งต้นว่าง (ข้อมูลต้นทางไม่มี) ให้นับเป็น 0 วัน แทนที่จะซ่อนบรรทัดไปเลย
+    if (rec.status) {
+      const d = daysSince(rec.submittedAt) ?? 0;
+      lines.push(`ระยะเวลาดำเนินการ: ${d} วัน`);
+    }
     return lines.join('\n');
   }
   if (type === 'su') {
-    return [
-      `🔄 ${rec.companyName} (ตรวจติดตาม - SU)`,
-      `ระบบ: ${rec.system || '-'}`,
-      `SU1: ${rec.su1Status || '(ยังไม่ระบุ)'}`,
-      `SU2: ${rec.su2Status || '(ยังไม่ถึงรอบ/ยังไม่ระบุ)'}`,
-    ].join('\n');
+    const su1Done = isDoneStatus(rec.su1Status);
+    const su2Done = isDoneStatus(rec.su2Status);
+    if (su1Done && su2Done) return null; // ผ่านทั้ง SU1 และ SU2 แล้ว ถือว่าจบรอบนี้
+    const lines = [`🔄 ${rec.companyName}`, `ระบบ: ${rec.system || '-'}`];
+    // ถ้า SU1 ผ่านแล้วแต่ SU2 ยังไม่เสร็จ โชว์เฉพาะ SU2 (ไม่โชว์ SU1 ที่ผ่านแล้วซ้ำ) - ไม่ต้องแปะ (SU1)/(SU2) ซ้ำเพราะบอกอยู่แล้วที่หน้าบรรทัด
+    // ระยะเวลาดำเนินการของแต่ละรอบ: นับจากวันที่ Sent Plan SU1/SU2 (เฉพาะรอบที่ Status มีข้อมูลแล้ว) ถึงวันนี้
+    if (!su1Done) {
+      lines.push(`SU1: ${rec.su1Status || '(ยังไม่ระบุ)'}`);
+      if (rec.su1Status) {
+        const d = daysSince(rec.su1SentPlan) ?? 0;
+        lines.push(`ระยะเวลาดำเนินการ SU1: ${d} วัน`);
+      }
+    }
+    if (!su2Done) {
+      lines.push(`SU2: ${rec.su2Status || '(ยังไม่ถึงรอบ/ยังไม่ระบุ)'}`);
+      if (rec.su2Status) {
+        const d = daysSince(rec.su2SentPlan) ?? 0;
+        lines.push(`ระยะเวลาดำเนินการ SU2: ${d} วัน`);
+      }
+    }
+    if (certStart) lines.push(`ใบรับรองเดิมเริ่ม: ${certStart}`);
+    if (certExpire) lines.push(`ใบรับรองเดิมหมดอายุ: ${certExpire}`);
+    return lines.join('\n');
+  }
+  // recer
+  if (isDoneStatus(rec.status)) return null;
+  const lines = [`♻️ ${rec.companyName}`, `ระบบ: ${rec.system || '-'}`];
+  if (rec.status) {
+    lines.push(`สถานะ: ${rec.status}(Recer)`);
+    // ระยะเวลาดำเนินการ: นับจากวันที่ยื่นขึ้นทะเบียนกับจีน ถึงวันนี้ (เฉพาะตอนที่ Status มีการลงข้อมูลแล้ว)
+    const d = daysSince(rec.submittedAt) ?? 0;
+    lines.push(`ระยะเวลาดำเนินการ: ${d} วัน`);
+  } else if (latestRound) {
+    // ช่อง Status ว่าง แต่มีรอบล่าสุดที่เสร็จแล้วอยู่ -> อนุมานว่ารอบล่าสุดเสร็จสิ้นแล้ว โชว์รอบ+วันที่แทนคำว่า "ยังไม่ระบุ"
+    lines.push(`สถานะ: เสร็จสิ้นรอบ(${latestRound.label}) ${latestRound.dateStr}`);
+  } else {
+    lines.push(`สถานะ: (ยังไม่ระบุ)`);
+  }
+  if (certStart) lines.push(`ใบรับรองเดิมเริ่ม: ${certStart}`);
+  if (certExpire) lines.push(`ใบรับรองเดิมหมดอายุ: ${certExpire}`);
+  return lines.join('\n');
+}
+
+// แปลงวันที่แบบ "dd/mm/yyyy" (string ที่ format ไว้แล้ว) กลับเป็นตัวเลขไว้เทียบว่าอันไหนใหม่กว่า
+function parseThaiDate(str) {
+  if (!str) return null;
+  const m = /^(\d{1,2})\/(\d{1,2})\/(\d{4})$/.exec(str.trim());
+  if (!m) return null;
+  const [, d, mo, y] = m;
+  const t = new Date(Number(y), Number(mo) - 1, Number(d)).getTime();
+  return Number.isNaN(t) ? null : t;
+}
+
+// บางบริษัทในไฟล์มีชื่อซ้ำแบบมีเลขวงเล็บต่อท้าย เช่น "ABC Co., Ltd." กับ "ABC Co., Ltd. (2)"
+// ซึ่งหมายถึงบริษัทเดียวกันแต่เป็นรอบ/สัญญาใหม่ - ตัดวงเล็บออกเพื่อจัดกลุ่มเป็นบริษัทเดียวกัน
+// และถือว่าเลขวงเล็บที่สูงกว่า = รอบที่ใหม่กว่าเสมอ (ไม่มีวงเล็บ = รอบแรก/เก่าที่สุด)
+function companyNameParts(name) {
+  const m = /^(.*?)\s*\((\d+)\)\s*$/.exec((name || '').trim());
+  if (m) return { base: m[1].trim(), suffix: Number(m[2]) };
+  return { base: (name || '').trim(), suffix: 0 };
+}
+
+// เลือก record ที่ "ใหม่ที่สุด" จากลิสต์เดียวกัน - ดูเลขวงเล็บต่อท้ายชื่อบริษัทก่อน (สูงกว่า = ใหม่กว่า)
+// ถ้าเลขวงเล็บเท่ากัน ค่อยเทียบจากวันออกใบรับรอง แล้ว fallback ไปวันที่ยื่นขึ้นทะเบียน
+function pickLatestRecord(records) {
+  if (records.length === 0) return null;
+  return records
+    .slice()
+    .sort((a, b) => {
+      const sa = companyNameParts(a.companyName).suffix;
+      const sb = companyNameParts(b.companyName).suffix;
+      if (sb !== sa) return sb - sa;
+      const da = parseThaiDate(a.cerIssueDate) ?? a.submittedAt ?? 0;
+      const db = parseThaiDate(b.cerIssueDate) ?? b.submittedAt ?? 0;
+      return db - da;
+    })[0];
+}
+
+// เมื่อทุกอย่าง (ทุก record ที่พบของบริษัทนี้) Done หมดแล้ว - สรุปรอบล่าสุดแทน
+// Recer ถือว่าเป็นรอบที่ใหม่กว่า Initial เสมอ (เกิดขึ้นทีหลัง Initial ในไทม์ไลน์จริง)
+// ถ้ามี record ของ Recer อยู่ ให้ใช้ Recer ล่าสุดเป็นตัวสรุป ถ้าไม่มีเลยค่อย fallback ไปที่ Initial ล่าสุด
+function buildLatestRoundSummary(companyName, records) {
+  const initials = records.filter((r) => r.type === 'initial').map((r) => r.rec);
+  const recers = records.filter((r) => r.type === 'recer').map((r) => r.rec);
+  const rec = pickLatestRecord(recers) || pickLatestRecord(initials);
+  if (!rec) {
+    return `✅ ${companyName} — ทุกขั้นตอนเสร็จสมบูรณ์แล้วครับ ไม่มีสถานะที่กำลังดำเนินการอยู่`;
   }
   const lines = [
-    `♻️ ${rec.companyName} (ต่ออายุใบรับรอง - Recer)`,
-    `ระบบ: ${rec.system || '-'}`,
-    `สถานะ: ${rec.status || '(ยังไม่ระบุ)'}`,
+    `✅ ${companyName} — ทุกขั้นตอนเสร็จสมบูรณ์แล้ว (ไม่มีสถานะที่กำลังดำเนินการอยู่) สรุปรอบล่าสุด:`,
+    `ระบบ/ขอบข่ายที่ตรวจ: ${rec.system || '-'}`,
   ];
-  if (rec.certExpireDate) lines.push(`ใบรับรองเดิมหมดอายุ: ${rec.certExpireDate}`);
-  if (rec.cerNo) lines.push(`เลขที่ใบรับรองใหม่: ${rec.cerNo}`);
+  if (rec.cerNo) lines.push(`เลขที่ใบรับรอง: ${rec.cerNo}`);
+  if (rec.cerIssueDate) lines.push(`วันที่ออกใบรับรอง: ${rec.cerIssueDate}`);
+  if (rec.cerExpireDate) lines.push(`วันที่หมดอายุ: ${rec.cerExpireDate}`);
   return lines.join('\n');
+}
+
+// หารอบที่มีวันที่บันทึกไว้ "ใกล้ปัจจุบันที่สุด" ของบริษัทนี้ - เทียบทั้ง 4 แหล่ง:
+// Initial (Cer Issue Date), SU1 (Cer. SU1 Date), SU2 (Cer. SU2 Date), Recer (Cer Issue Date)
+// ไม่สนว่า record นั้น Done หรือยัง (record ที่ยังไม่เสร็จมักไม่มีวันที่อยู่แล้ว จึงไม่ถูกเลือกโดยธรรมชาติ)
+// คืนค่า { dateStr, label } โดย label บอกว่าวันที่นั้นมาจากรอบไหน (Initial/SU1/SU2/Recer)
+function latestCompletedRound(records) {
+  const candidates = [];
+  for (const { type, rec } of records) {
+    if (type === 'initial' || type === 'recer') {
+      const t = parseThaiDate(rec.cerIssueDate);
+      if (t !== null) candidates.push({ t, dateStr: rec.cerIssueDate, label: type === 'initial' ? 'Initial' : 'Recer' });
+    } else if (type === 'su') {
+      const t1 = parseThaiDate(rec.su1CertDate);
+      if (t1 !== null) candidates.push({ t: t1, dateStr: rec.su1CertDate, label: 'SU1' });
+      const t2 = parseThaiDate(rec.su2CertDate);
+      if (t2 !== null) candidates.push({ t: t2, dateStr: rec.su2CertDate, label: 'SU2' });
+    }
+  }
+  if (candidates.length === 0) return null;
+  candidates.sort((a, b) => b.t - a.t);
+  return candidates[0];
+}
+
+// วันที่ "ใบรับรองฉบับปัจจุบันเริ่มมีผล" - ดูจาก Cer Issue Date ของ Initial หรือ Recer เท่านั้น (เอาที่ล่าสุด)
+// ไม่ใช้วันที่ของ SU เลย เพราะ SU เป็นแค่การตรวจติดตามใบรับรองเดิม ไม่ได้ออกใบรับรองใหม่
+// (ใบรับรองมีอายุ 3 ปี และวัน issue ของรอบใหม่จะอยู่หลังวันหมดอายุของรอบก่อนหน้า 1 วันเสมอ)
+function latestCertStart(records) {
+  const candidates = [];
+  for (const { type, rec } of records) {
+    if (type === 'initial' || type === 'recer') {
+      const t = parseThaiDate(rec.cerIssueDate);
+      if (t !== null) candidates.push({ t, dateStr: rec.cerIssueDate });
+    }
+  }
+  if (candidates.length === 0) return null;
+  candidates.sort((a, b) => b.t - a.t);
+  return candidates[0].dateStr;
+}
+
+// วันที่ "ใบรับรองฉบับปัจจุบันหมดอายุ" - คู่กับ latestCertStart (เอาวันหมดอายุที่ล่าสุด จาก Initial (Cer Expire Date)
+// หรือ Recer (วันที่ cer จีนหมดอายุ) เท่านั้น) เพื่อให้สอดคล้องกับใบรับรองฉบับเดียวกับที่ certStart อ้างถึง
+function latestCertExpire(records) {
+  const candidates = [];
+  for (const { type, rec } of records) {
+    if (type === 'initial' && rec.cerExpireDate) {
+      const t = parseThaiDate(rec.cerExpireDate);
+      if (t !== null) candidates.push({ t, dateStr: rec.cerExpireDate });
+    } else if (type === 'recer' && rec.certExpireDate) {
+      const t = parseThaiDate(rec.certExpireDate);
+      if (t !== null) candidates.push({ t, dateStr: rec.certExpireDate });
+    }
+  }
+  if (candidates.length === 0) return null;
+  candidates.sort((a, b) => b.t - a.t);
+  return candidates[0].dateStr;
+}
+
+// รวม record ทั้งหมดของบริษัทเดียวกันเข้าด้วยกัน แล้วตัดสินใจว่าจะโชว์สถานะที่กำลังทำอยู่ หรือสรุปรอบล่าสุด
+function buildCompanyBlock(companyName, records) {
+  const latestRound = latestCompletedRound(records);
+  const certStart = latestCertStart(records);
+  const certExpire = latestCertExpire(records);
+  const inProgress = records.map((r) => formatInProgress(r, latestRound, certStart, certExpire)).filter(Boolean);
+  if (inProgress.length > 0) return inProgress.join('\n\n');
+  return buildLatestRoundSummary(companyName, records);
 }
 
 const MAX_RESULTS = 8;
@@ -258,19 +464,35 @@ function buildStatusReply(query) {
   if (!DB.updatedAt) {
     return 'ยังไม่มีข้อมูลในระบบครับ รบกวนให้แอดมินอัปโหลดไฟล์ Excel ที่หน้า /upload ก่อนนะครับ';
   }
+  if (!norm(query)) {
+    return `"${query}" เป็นคำทั่วไปเกินไปครับ (เช่น Co., Ltd. / บริษัท / จำกัด) รบกวนพิมพ์ชื่อเฉพาะของบริษัทด้วยครับ`;
+  }
   const results = searchCompanies(query);
   if (results.length === 0) {
     return `ไม่พบชื่อบริษัทที่ตรงกับ "${query}" ครับ ลองพิมพ์บางส่วนของชื่อบริษัทดูใหม่`;
   }
-  if (results.length > MAX_RESULTS) {
-    const names = [...new Set(results.map((r) => r.rec.companyName))].slice(0, MAX_RESULTS);
+
+  // จัดกลุ่ม record ตามชื่อบริษัท (query แบบ substring อาจเจอได้หลายบริษัท)
+  // ใช้ชื่อบริษัทแบบตัดเลขวงเล็บต่อท้ายออก (companyNameParts().base) เป็น key เพื่อรวม
+  // ชื่อซ้ำที่เป็นรอบใหม่ เช่น "ABC Co., Ltd." กับ "ABC Co., Ltd. (2)" ให้เป็นบริษัทเดียวกัน
+  const byCompany = new Map();
+  for (const r of results) {
+    const key = companyNameParts(r.rec.companyName).base;
+    if (!byCompany.has(key)) byCompany.set(key, []);
+    byCompany.get(key).push(r);
+  }
+
+  if (byCompany.size > MAX_RESULTS) {
+    const names = [...byCompany.keys()].slice(0, MAX_RESULTS);
     return (
-      `พบ ${results.length} รายการที่ตรงกับ "${query}" เยอะเกินไป กรุณาพิมพ์ชื่อให้เจาะจงมากขึ้นครับ\n\n` +
+      `พบ ${byCompany.size} บริษัทที่ตรงกับ "${query}" เยอะเกินไป กรุณาพิมพ์ชื่อให้เจาะจงมากขึ้นครับ\n\n` +
       `ตัวอย่างที่พบ:\n` +
       names.map((n) => '- ' + n).join('\n')
     );
   }
-  return results.map(formatCustomerResult).join('\n\n---\n\n');
+
+  const blocks = [...byCompany.entries()].map(([name, records]) => buildCompanyBlock(name, records));
+  return blocks.join('\n\n---\n\n');
 }
 // ==== จบส่วนเช็คสถานะงานลูกค้า ====================================================
 
@@ -500,6 +722,21 @@ async function handleEvent(event) {
     return;
   }
 
+  // เช็ครายชื่อคนที่บอทรู้จักในกลุ่มนี้ (ใช้เป็นคำตอบของคำถาม /ใคร ได้)
+  if (/^\/(สมาชิก|members)$/i.test(text)) {
+    const members = (db.groupMembers && db.groupMembers[groupId]) || {};
+    const names = Object.values(members);
+    if (names.length === 0) {
+      await reply(event, 'ยังไม่รู้จักใครในกลุ่มนี้เลยครับ ให้สมาชิกลองพิมพ์อะไรในกลุ่มสักครั้งก่อน บอทถึงจะจำชื่อไว้ได้');
+    } else {
+      await reply(
+        event,
+        `👥 คนที่บอทรู้จักในกลุ่มนี้ (${names.length} คน) — ใช้เป็นคำตอบของ /ใคร ได้:\n` + names.join(', ')
+      );
+    }
+    return;
+  }
+
   // คำถาม "/ใคร....." - สุ่มคำตอบเป็นคนในกลุ่ม (ใช้ได้ทุกคน ทุกกลุ่ม)
   const whoMatch = text.match(/^\/ใคร(.*)$/);
   if (whoMatch) {
@@ -564,6 +801,7 @@ async function handleEvent(event) {
         'ใช้ได้ทุกคนทุกกลุ่ม:',
         'พิมพ์ /food, /menu, /เมนู หรือ "กินไรดี" ให้บอทสุ่มเมนูอาหารไทย',
         '/ใคร<คำถาม> เช่น "/ใครหล่อที่สุด" - สุ่มคำตอบเป็นคนในกลุ่ม',
+        '/สมาชิก - ดูว่าบอทรู้จักใครในกลุ่มนี้บ้าง (ใช้เป็นคำตอบของ /ใคร ได้)',
         '/groupid - ดู groupId ของกลุ่มนี้',
       ].join('\n')
     );
