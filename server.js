@@ -347,13 +347,61 @@ function parseThaiDate(str) {
   return Number.isNaN(t) ? null : t;
 }
 
+// รหัสมาตรฐานที่บริษัทนี้ตรวจ (พบในข้อมูลจริงของไฟล์ทั้งหมด) - ใช้เพื่อรู้จำ "แท็กระบบ" ที่แอดมินแปะต่อ/แทรกไว้ในชื่อบริษัท
+// เช่น "ABC Co., Ltd. (9001)", "ABC Co., Ltd. [14001]", "ABC Co., Ltd. 9001" ซึ่งไม่ใช่ส่วนหนึ่งของชื่อบริษัทจริงๆ
+// แต่เป็นโน้ตบอกว่าแถวนี้เกี่ยวกับระบบ/มาตรฐานไหน (บริษัทเดียวกันบางเจ้าตรวจหลายระบบแยกกันคนละรอบ เช่น 9001 กับ 14001)
+const KNOWN_STANDARD_CODES = ['9001', '14001', '45001'];
+// (A) แท็กระบบที่มีวงเล็บ(เหลี่ยม/กลม)เปิด-ปิดครบ และในวงเล็บมี "รหัสเดียวล้วนๆ" เท่านั้น เช่น "(9001)", "[14001]", "(9001:2015)"
+// อยู่ตรงไหนของชื่อก็ตัดได้ (ไม่ต้องอยู่ท้ายสุด เช่น "ABC Co., Ltd. [14001] (2)") - ต้องมีวงเล็บเปิดจริงๆ ไม่ใช่ optional
+// เพื่อไม่ให้ไปแมตช์ท้ายๆ ของวงเล็บที่ระบุหลายมาตรฐานพร้อมกัน เช่น "(9001 & 14001)" หรือ "(9001, 14001, 45001)"
+// (พวกนี้ไม่มีวงเล็บเปิดอยู่ติดกับรหัสตัวท้ายเลย เลยไม่ตรง pattern นี้ - ปลอดภัย)
+const BRACKETED_SINGLE_TAG_RE = new RegExp(
+  `[\\[\\(]\\s*(?:${KNOWN_STANDARD_CODES.join('|')})(?::\\d{4})?\\s*[\\]\\)]`,
+  'gi'
+);
+// (B) แท็กระบบท้ายชื่อแบบไม่มีวงเล็บเลย เช่น "... 9001" - ต้องอยู่ท้ายสุดจริงๆ (ไม่มีวงเล็บปิดตามหลัง กันซ้อนกับ (A))
+const BARE_TRAILING_TAG_RE = new RegExp(`(?:^|\\s)(?:${KNOWN_STANDARD_CODES.join('|')})(?::\\d{4})?\\s*$`, 'i');
+function stripSystemTag(name) {
+  let s = (name || '').replace(BRACKETED_SINGLE_TAG_RE, ' ').replace(/\s+/g, ' ').trim();
+  s = s.replace(BARE_TRAILING_TAG_RE, '').trim();
+  return s || (name || '').trim(); // กันเผื่อ regex กินชื่อทั้งหมดจนว่าง (ไม่ควรเกิด แต่กันไว้)
+}
+
+// รวมชื่อระบบที่มีได้หลายบรรทัด (เช่น "9001:2015\n14001:2015") ให้เทียบกันได้โดยไม่สนลำดับ/ตัวพิมพ์เล็กใหญ่
+// ใช้เป็นส่วนหนึ่งของ key ตอนจัดกลุ่มบริษัท กันไม่ให้ข้อมูลของคนละระบบ (เช่น SU ของ 9001) ไปปนกับอีกระบบ (เช่น Initial/Recer ของ 14001)
+function normalizeSystem(system) {
+  if (!system) return '';
+  return system
+    .split('\n')
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean)
+    .sort()
+    .join('+');
+}
+
 // บางบริษัทในไฟล์มีชื่อซ้ำแบบมีเลขวงเล็บต่อท้าย เช่น "ABC Co., Ltd." กับ "ABC Co., Ltd. (2)"
 // ซึ่งหมายถึงบริษัทเดียวกันแต่เป็นรอบ/สัญญาใหม่ - ตัดวงเล็บออกเพื่อจัดกลุ่มเป็นบริษัทเดียวกัน
 // และถือว่าเลขวงเล็บที่สูงกว่า = รอบที่ใหม่กว่าเสมอ (ไม่มีวงเล็บ = รอบแรก/เก่าที่สุด)
 function companyNameParts(name) {
-  const m = /^(.*?)\s*\((\d+)\)\s*$/.exec((name || '').trim());
+  const trimmed = stripSystemTag((name || '').trim());
+
+  // กรณีวงเล็บเป็นเลขล้วนๆ เช่น "ABC Co., Ltd. (2)"
+  let m = /^(.*?)\s*\((\d+)\)\s*$/.exec(trimmed);
   if (m) return { base: m[1].trim(), suffix: Number(m[2]) };
-  return { base: (name || '').trim(), suffix: 0 };
+
+  // กรณีวงเล็บระบุรอบงานเป็นคำ+เลข เช่น "ABC(Recer2)", "ABC Co., Ltd.(Recer3)", "ABC (New Initial)", "ABC (2nd New Initial)"
+  // (พบในไฟล์จริงว่าแอดมินบางแถวใช้ป้ายกำกับแบบนี้แทนเลขวงเล็บล้วนๆ ต้องรองรับด้วย ไม่งั้นแถวพวกนี้จะไม่ถูกรวมเป็นบริษัทเดียวกัน)
+  // ถ้าไม่มีเลขกำกับเลย (เช่น "(New Initial)" เฉยๆ) ถือเป็นรอบที่ 1
+  // ไม่แตะวงเล็บอื่นๆ ที่ไม่ใช่รูปแบบนี้ (เช่น "(9001 & 14001)" ที่บอกขอบข่ายที่ตรวจ หรือ "(ยกเลิก)" หรือโน้ตอื่นๆ) เพราะไม่ใช่ตัวบ่งบอกรอบงานซ้ำ
+  m = /^(.*?)\s*\(\s*(?:(\d+)\s*(?:st|nd|rd|th)?\s*)?(?:recer|su|initial|new\s*initial)\s*(\d+)?\s*\)\s*$/i.exec(trimmed);
+  if (m) {
+    const leading = m[2] !== undefined ? Number(m[2]) : null;
+    const trailing = m[3] !== undefined ? Number(m[3]) : null;
+    const suffix = trailing !== null ? trailing : leading !== null ? leading : 1;
+    return { base: m[1].trim(), suffix };
+  }
+
+  return { base: trimmed, suffix: 0 };
 }
 
 // เลือก record ที่ "ใหม่ที่สุด" จากลิสต์เดียวกัน - ดูเลขวงเล็บต่อท้ายชื่อบริษัทก่อน (สูงกว่า = ใหม่กว่า)
@@ -448,8 +496,34 @@ function latestCertExpire(records) {
   return candidates[0].dateStr;
 }
 
+// คีย์สำหรับ "จัดกลุ่ม" ชื่อบริษัทเข้าด้วยกัน (คนละอันกับ companyNameParts().base ที่ใช้โชว์ผล)
+// ตัดจุด/คอมมา/เว้นวรรคซ้ำ/ตัวพิมพ์เล็กใหญ่ออกก่อนเทียบ เพราะบางแถวในไฟล์จริงพิมพ์ชื่อบริษัทเดียวกันไม่ตรงกันเป๊ะ
+// (เช่น "...CO., LTD (ยกเลิก)" ไม่มีจุด กับ "...CO., LTD. (ยกเลิก)" มีจุด) ถ้าไม่ตัดจะถูกมองว่าเป็นคนละบริษัท
+function groupingKey(base) {
+  return (base || '')
+    .toLowerCase()
+    .replace(/[.,]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+// เช็คว่าชื่อบริษัท (record ใดก็ตามของกลุ่มนี้) มีคำว่า "ยกเลิก" กำกับไว้ไหม - แปลว่ารายการนี้ถูกยกเลิกไปแล้ว
+function isCancelledName(name) {
+  return /ยกเลิก/.test(name || '');
+}
+
 // รวม record ทั้งหมดของบริษัทเดียวกันเข้าด้วยกัน แล้วตัดสินใจว่าจะโชว์สถานะที่กำลังทำอยู่ หรือสรุปรอบล่าสุด
 function buildCompanyBlock(companyName, records) {
+  // ถ้ามีคำว่า "ยกเลิก" กำกับอยู่ในชื่อบริษัทของ record ไหนก็ตามในกลุ่มนี้ ถือว่ารายการนี้ถูกยกเลิกไปแล้ว
+  // ไม่ต้องไปคำนวณสถานะ/วันที่ตามปกติ เพราะข้อมูลอาจไม่สมบูรณ์และไม่มีความหมายอีกต่อไป
+  const cancelled = records.some((r) => isCancelledName(r.rec.companyName)) || isCancelledName(companyName);
+  if (cancelled) {
+    const cleanName = companyName
+      .replace(/\s*\(\s*ยกเลิก\s*\)\s*/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    return `🚫 ${cleanName}\nรายการนี้ถูกยกเลิกแล้วครับ (มีการระบุ "ยกเลิก" ไว้ในข้อมูล) กรุณาตรวจสอบกับแอดมินอีกครั้งหากต้องการรายละเอียดเพิ่มเติม`;
+  }
   const latestRound = latestCompletedRound(records);
   const certStart = latestCertStart(records);
   const certExpire = latestCertExpire(records);
@@ -473,17 +547,53 @@ function buildStatusReply(query) {
   }
 
   // จัดกลุ่ม record ตามชื่อบริษัท (query แบบ substring อาจเจอได้หลายบริษัท)
-  // ใช้ชื่อบริษัทแบบตัดเลขวงเล็บต่อท้ายออก (companyNameParts().base) เป็น key เพื่อรวม
-  // ชื่อซ้ำที่เป็นรอบใหม่ เช่น "ABC Co., Ltd." กับ "ABC Co., Ltd. (2)" ให้เป็นบริษัทเดียวกัน
-  const byCompany = new Map();
+  // ใช้ชื่อบริษัทแบบตัดเลขวงเล็บ/แท็กระบบต่อท้ายออก (companyNameParts().base) เป็นชื่อที่โชว์
+  // แต่ใช้ groupingKey() (ตัดจุด/คอมมา/เว้นวรรคซ้ำ/ตัวพิมพ์เล็กใหญ่) + ระบบมาตรฐานที่ตรวจ (normalizeSystem)
+  // เป็น key ในการรวมกลุ่มจริงๆ - ต้องรวมระบบเข้าไปด้วย เพราะบางบริษัทตรวจหลายระบบ (เช่น 9001 กับ 14001)
+  // แยกกันคนละรอบ/คนละไทม์ไลน์ ถ้ารวมกลุ่มแค่ตามชื่อเฉยๆ ข้อมูล SU/Recer ของระบบหนึ่งจะไปปนกับอีกระบบ
+  // (เจอจากเคสจริง เช่น VBS. SERVICE COMPANY LIMITED และ Centralize Power Industry Co., Ltd.)
+  // ทำ 2 รอบ: รอบแรกรวม record ที่ "มี" ระบบระบุไว้ก่อน (แยกกลุ่มตามระบบจริงๆ)
+  // รอบสองค่อยจัดการ record ที่ "ไม่มี" ระบบระบุไว้ (ช่องว่าง/null เช่นแถว Recer ที่ถูกยกเลิกจนข้อมูลว่างหมด)
+  // - ถ้าบริษัทนี้มีกลุ่มที่มีระบบอยู่แล้ว ให้รวมเข้ากลุ่มแรกที่เจอไปเลย (ดีกว่าแยกเป็นกลุ่มลอยๆ ไม่มีข้อมูลอะไรเลย)
+  // - ถ้ายังไม่มีกลุ่มไหนของบริษัทนี้เลย ค่อยตั้งกลุ่มใหม่แบบไม่ระบุระบบ
+  const byCompany = new Map(); // "groupingKey::system" -> { displayName, baseKey, records }
+  const withoutSystem = [];
   for (const r of results) {
-    const key = companyNameParts(r.rec.companyName).base;
-    if (!byCompany.has(key)) byCompany.set(key, []);
-    byCompany.get(key).push(r);
+    const base = companyNameParts(r.rec.companyName).base;
+    const baseKey = groupingKey(base);
+    const sysKey = normalizeSystem(r.rec.system);
+    if (!sysKey) {
+      withoutSystem.push({ r, base, baseKey });
+      continue;
+    }
+    const key = baseKey + '::' + sysKey;
+    if (!byCompany.has(key)) byCompany.set(key, { displayName: base, baseKey, records: [] });
+    byCompany.get(key).records.push(r);
+  }
+  for (const { r, base, baseKey } of withoutSystem) {
+    const existing = [...byCompany.values()].find((v) => v.baseKey === baseKey);
+    if (existing) {
+      existing.records.push(r);
+    } else {
+      const key = baseKey + '::';
+      if (!byCompany.has(key)) byCompany.set(key, { displayName: base, baseKey, records: [] });
+      byCompany.get(key).records.push(r);
+    }
+  }
+
+  // ถ้าบริษัทเดียวกัน (ชื่อฐานเดียวกัน) ถูกแยกเป็นหลายกลุ่มเพราะคนละระบบ ให้ต่อท้ายชื่อที่โชว์ด้วยระบบนั้นๆ
+  // กันสับสนว่าบล็อกไหนเป็นของระบบไหน (ถ้ามีระบบเดียวกลุ่มเดียวอยู่แล้ว ไม่ต้องต่อท้ายให้รกโดยไม่จำเป็น)
+  const baseKeyCount = new Map();
+  for (const v of byCompany.values()) baseKeyCount.set(v.baseKey, (baseKeyCount.get(v.baseKey) || 0) + 1);
+  for (const v of byCompany.values()) {
+    if (baseKeyCount.get(v.baseKey) > 1) {
+      const sysLabel = v.records.map((r) => r.rec.system).find(Boolean);
+      if (sysLabel) v.displayName = `${v.displayName} [${sysLabel.replace(/\n/g, ' & ')}]`;
+    }
   }
 
   if (byCompany.size > MAX_RESULTS) {
-    const names = [...byCompany.keys()].slice(0, MAX_RESULTS);
+    const names = [...byCompany.values()].map((v) => v.displayName).slice(0, MAX_RESULTS);
     return (
       `พบ ${byCompany.size} บริษัทที่ตรงกับ "${query}" เยอะเกินไป กรุณาพิมพ์ชื่อให้เจาะจงมากขึ้นครับ\n\n` +
       `ตัวอย่างที่พบ:\n` +
@@ -491,7 +601,7 @@ function buildStatusReply(query) {
     );
   }
 
-  const blocks = [...byCompany.entries()].map(([name, records]) => buildCompanyBlock(name, records));
+  const blocks = [...byCompany.values()].map(({ displayName, records }) => buildCompanyBlock(displayName, records));
   return blocks.join('\n\n---\n\n');
 }
 // ==== จบส่วนเช็คสถานะงานลูกค้า ====================================================
