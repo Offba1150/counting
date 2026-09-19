@@ -280,6 +280,12 @@ function daysSince(fromMs) {
 // certStart (ถ้ามี) คือวันที่ "ใบรับรองฉบับปัจจุบันเริ่มมีผล" - ดูจาก Initial/Recer เท่านั้น (ไม่รวม SU เพราะ SU ไม่ได้ออกใบรับรองใหม่)
 // certExpire (ถ้ามี) คือวันที่ "ใบรับรองฉบับปัจจุบันหมดอายุ" - คู่กับ certStart เดียวกัน (ดูจาก Initial/Recer เท่านั้น)
 //   ทั้งสองค่านี้โชว์ทุก sheet ยกเว้น Initial (เพราะรอบ Initial ยังไม่เคยได้ใบ cer มาก่อน จึงไม่มีข้อมูลใบเดิม)
+// แปลง timestamp (ms) เป็นวันที่ dd/mm/yyyy สำหรับโชว์ควบคู่กับบรรทัด "ระยะเวลาดำเนินการ" - คืน null ถ้าไม่มีข้อมูลวันที่
+function formatEpochDate(ms) {
+  if (ms === null || ms === undefined) return null;
+  return formatDate(new Date(ms));
+}
+
 function formatInProgress({ type, rec }, latestRound, certStart, certExpire) {
   if (type === 'initial') {
     if (isDoneStatus(rec.status)) return null;
@@ -289,7 +295,8 @@ function formatInProgress({ type, rec }, latestRound, certStart, certExpire) {
     // ถ้าช่องวันที่ตั้งต้นว่าง (ข้อมูลต้นทางไม่มี) ให้นับเป็น 0 วัน แทนที่จะซ่อนบรรทัดไปเลย
     if (rec.status) {
       const d = daysSince(rec.submittedAt) ?? 0;
-      lines.push(`ระยะเวลาดำเนินการ: ${d} วัน`);
+      const startText = formatEpochDate(rec.submittedAt);
+      lines.push(`ระยะเวลาดำเนินการ: ${d} วัน${startText ? ` (เริ่ม ${startText})` : ''}`);
     }
     return lines.join('\n');
   }
@@ -311,14 +318,16 @@ function formatInProgress({ type, rec }, latestRound, certStart, certExpire) {
         lines.push(`SU1: ${rec.su1Status || '(ยังไม่ระบุ)'}`);
         if (rec.su1Status) {
           const d = daysSince(rec.su1SentPlan) ?? 0;
-          lines.push(`ระยะเวลาดำเนินการ SU1: ${d} วัน`);
+          const startText = formatEpochDate(rec.su1SentPlan);
+          lines.push(`ระยะเวลาดำเนินการ SU1: ${d} วัน${startText ? ` (เริ่ม ${startText})` : ''}`);
         }
       }
       if (!su2Done) {
         lines.push(`SU2: ${rec.su2Status || '(ยังไม่ถึงรอบ/ยังไม่ระบุ)'}`);
         if (rec.su2Status) {
           const d = daysSince(rec.su2SentPlan) ?? 0;
-          lines.push(`ระยะเวลาดำเนินการ SU2: ${d} วัน`);
+          const startText = formatEpochDate(rec.su2SentPlan);
+          lines.push(`ระยะเวลาดำเนินการ SU2: ${d} วัน${startText ? ` (เริ่ม ${startText})` : ''}`);
         }
       }
     }
@@ -333,7 +342,8 @@ function formatInProgress({ type, rec }, latestRound, certStart, certExpire) {
     lines.push(`สถานะ: ${rec.status}(Recer)`);
     // ระยะเวลาดำเนินการ: นับจากวันที่ยื่นขึ้นทะเบียนกับจีน ถึงวันนี้ (เฉพาะตอนที่ Status มีการลงข้อมูลแล้ว)
     const d = daysSince(rec.submittedAt) ?? 0;
-    lines.push(`ระยะเวลาดำเนินการ: ${d} วัน`);
+    const startText = formatEpochDate(rec.submittedAt);
+    lines.push(`ระยะเวลาดำเนินการ: ${d} วัน${startText ? ` (เริ่ม ${startText})` : ''}`);
   } else if (latestRound) {
     // ช่อง Status ว่าง แต่มีรอบล่าสุดที่เสร็จแล้วอยู่ -> อนุมานว่ารอบล่าสุดเสร็จสิ้นแล้ว โชว์รอบ+วันที่แทนคำว่า "ยังไม่ระบุ"
     lines.push(`สถานะ: เสร็จสิ้นรอบ(${latestRound.label}) ${latestRound.dateStr}`);
