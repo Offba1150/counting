@@ -298,20 +298,26 @@ function formatInProgress({ type, rec }, latestRound, certStart, certExpire) {
     const su2Done = isDoneStatus(rec.su2Status);
     if (su1Done && su2Done) return null; // ผ่านทั้ง SU1 และ SU2 แล้ว ถือว่าจบรอบนี้
     const lines = [`🔄 ${rec.companyName}`, `ระบบ: ${rec.system || '-'}`];
-    // ถ้า SU1 ผ่านแล้วแต่ SU2 ยังไม่เสร็จ โชว์เฉพาะ SU2 (ไม่โชว์ SU1 ที่ผ่านแล้วซ้ำ) - ไม่ต้องแปะ (SU1)/(SU2) ซ้ำเพราะบอกอยู่แล้วที่หน้าบรรทัด
-    // ระยะเวลาดำเนินการของแต่ละรอบ: นับจากวันที่ Sent Plan SU1/SU2 (เฉพาะรอบที่ Status มีข้อมูลแล้ว) ถึงวันนี้
-    if (!su1Done) {
-      lines.push(`SU1: ${rec.su1Status || '(ยังไม่ระบุ)'}`);
-      if (rec.su1Status) {
-        const d = daysSince(rec.su1SentPlan) ?? 0;
-        lines.push(`ระยะเวลาดำเนินการ SU1: ${d} วัน`);
+    // ถ้า SU1 ผ่านแล้ว แต่ SU2 ยังไม่มีข้อมูลอะไรเลยในไฟล์ (ยังไม่เริ่มตรวจ ไม่ใช่แค่ "ยังไม่เสร็จ")
+    // สรุปเป็นสถานะเดียวให้อ่านง่ายชัดเจนไปเลยว่า "ตรวจ SU1 เสร็จแล้ว รอตรวจ SU2" แทนที่จะโชว์ช่อง SU2 เป็น placeholder เฉยๆ
+    if (su1Done && !su2Done && !rec.su2Status) {
+      lines.push(`สถานะ: ตรวจ SU1 เสร็จแล้ว รอตรวจ SU2`);
+    } else {
+      // ถ้า SU1 ผ่านแล้วแต่ SU2 ยังไม่เสร็จ (มีข้อมูลบ้างแล้ว) โชว์เฉพาะ SU2 (ไม่โชว์ SU1 ที่ผ่านแล้วซ้ำ)
+      // ระยะเวลาดำเนินการของแต่ละรอบ: นับจากวันที่ Sent Plan SU1/SU2 (เฉพาะรอบที่ Status มีข้อมูลแล้ว) ถึงวันนี้
+      if (!su1Done) {
+        lines.push(`SU1: ${rec.su1Status || '(ยังไม่ระบุ)'}`);
+        if (rec.su1Status) {
+          const d = daysSince(rec.su1SentPlan) ?? 0;
+          lines.push(`ระยะเวลาดำเนินการ SU1: ${d} วัน`);
+        }
       }
-    }
-    if (!su2Done) {
-      lines.push(`SU2: ${rec.su2Status || '(ยังไม่ถึงรอบ/ยังไม่ระบุ)'}`);
-      if (rec.su2Status) {
-        const d = daysSince(rec.su2SentPlan) ?? 0;
-        lines.push(`ระยะเวลาดำเนินการ SU2: ${d} วัน`);
+      if (!su2Done) {
+        lines.push(`SU2: ${rec.su2Status || '(ยังไม่ถึงรอบ/ยังไม่ระบุ)'}`);
+        if (rec.su2Status) {
+          const d = daysSince(rec.su2SentPlan) ?? 0;
+          lines.push(`ระยะเวลาดำเนินการ SU2: ${d} วัน`);
+        }
       }
     }
     if (certStart) lines.push(`ใบรับรองเดิมเริ่ม: ${certStart}`);
@@ -367,6 +373,34 @@ function stripSystemTag(name) {
   return s || (name || '').trim(); // กันเผื่อ regex กินชื่อทั้งหมดจนว่าง (ไม่ควรเกิด แต่กันไว้)
 }
 
+// (C) แท็กระบบท้ายชื่อที่ระบุ "หลายมาตรฐานรวมกัน" เช่น "(9001 & 45001)" หรือ "(9001, 14001, 45001)"
+// ตัดออกได้ก็ต่อเมื่อชุดมาตรฐานในวงเล็บ "ตรงกับช่องระบบ ของแถวนั้นเป๊ะๆ" เท่านั้น (แปลว่าเป็นแค่โน้ตย้ำขอบข่ายของรอบเดียวกัน)
+// ถ้าไม่ตรง (เช่นวงเล็บบอก 3 มาตรฐาน แต่ช่องระบบมีแค่มาตรฐานเดียว) ถือว่าข้อมูลน่าสงสัย ไม่แตะ ปล่อยให้แยกกลุ่มไว้เพื่อให้เห็นความผิดปกติ
+// (เจอจากเคสจริง เช่น C.E.G. Engineering ที่ตัดแล้วรวมกลุ่มถูก ตรงข้ามกับ BEST IN GROUND บางแถวที่ตัดไม่ได้เพราะช่องระบบขัดแย้งกับวงเล็บ)
+function extractSystemCodes(text) {
+  return new Set((text || '').match(new RegExp(KNOWN_STANDARD_CODES.join('|'), 'g')) || []);
+}
+function sameCodeSet(a, b) {
+  return a.size > 0 && a.size === b.size && [...a].every((c) => b.has(c));
+}
+const COMPOUND_BRACKET_RE = /\(([^()]+)\)\s*$/;
+function stripCompoundSystemTagIfSafe(name, system) {
+  const trimmed = (name || '').trim();
+  const m = COMPOUND_BRACKET_RE.exec(trimmed);
+  if (!m) return trimmed;
+  const inside = m[1];
+  const codesInBracket = extractSystemCodes(inside);
+  if (codesInBracket.size < 2) return trimmed; // วงเล็บโค้ดเดียวจัดการโดย (A)/(B) ไปแล้ว ไม่เกี่ยวกับฟังก์ชันนี้
+  // เนื้อหาในวงเล็บต้องมีแค่รหัสมาตรฐาน + เครื่องหมายคั่น (comma, &, colon, ปี ค.ศ., เว้นวรรค) เท่านั้น ห้ามมีคำอื่นปนเลย
+  const residue = inside
+    .replace(new RegExp(KNOWN_STANDARD_CODES.join('|'), 'g'), '')
+    .replace(/\d{4}/g, '')
+    .replace(/[\s,:&]/g, '');
+  if (residue !== '') return trimmed;
+  if (!sameCodeSet(codesInBracket, extractSystemCodes(system))) return trimmed;
+  return trimmed.slice(0, m.index).trim();
+}
+
 // รวมชื่อระบบที่มีได้หลายบรรทัด (เช่น "9001:2015\n14001:2015") ให้เทียบกันได้โดยไม่สนลำดับ/ตัวพิมพ์เล็กใหญ่
 // ใช้เป็นส่วนหนึ่งของ key ตอนจัดกลุ่มบริษัท กันไม่ให้ข้อมูลของคนละระบบ (เช่น SU ของ 9001) ไปปนกับอีกระบบ (เช่น Initial/Recer ของ 14001)
 function normalizeSystem(system) {
@@ -382,8 +416,8 @@ function normalizeSystem(system) {
 // บางบริษัทในไฟล์มีชื่อซ้ำแบบมีเลขวงเล็บต่อท้าย เช่น "ABC Co., Ltd." กับ "ABC Co., Ltd. (2)"
 // ซึ่งหมายถึงบริษัทเดียวกันแต่เป็นรอบ/สัญญาใหม่ - ตัดวงเล็บออกเพื่อจัดกลุ่มเป็นบริษัทเดียวกัน
 // และถือว่าเลขวงเล็บที่สูงกว่า = รอบที่ใหม่กว่าเสมอ (ไม่มีวงเล็บ = รอบแรก/เก่าที่สุด)
-function companyNameParts(name) {
-  const trimmed = stripSystemTag((name || '').trim());
+function companyNameParts(name, system) {
+  const trimmed = stripSystemTag(stripCompoundSystemTagIfSafe((name || '').trim(), system));
 
   // กรณีวงเล็บเป็นเลขล้วนๆ เช่น "ABC Co., Ltd. (2)"
   let m = /^(.*?)\s*\((\d+)\)\s*$/.exec(trimmed);
@@ -411,8 +445,8 @@ function pickLatestRecord(records) {
   return records
     .slice()
     .sort((a, b) => {
-      const sa = companyNameParts(a.companyName).suffix;
-      const sb = companyNameParts(b.companyName).suffix;
+      const sa = companyNameParts(a.companyName, a.system).suffix;
+      const sb = companyNameParts(b.companyName, b.system).suffix;
       if (sb !== sa) return sb - sa;
       const da = parseThaiDate(a.cerIssueDate) ?? a.submittedAt ?? 0;
       const db = parseThaiDate(b.cerIssueDate) ?? b.submittedAt ?? 0;
@@ -462,38 +496,37 @@ function latestCompletedRound(records) {
   return candidates[0];
 }
 
-// วันที่ "ใบรับรองฉบับปัจจุบันเริ่มมีผล" - ดูจาก Cer Issue Date ของ Initial หรือ Recer เท่านั้น (เอาที่ล่าสุด)
-// ไม่ใช้วันที่ของ SU เลย เพราะ SU เป็นแค่การตรวจติดตามใบรับรองเดิม ไม่ได้ออกใบรับรองใหม่
-// (ใบรับรองมีอายุ 3 ปี และวัน issue ของรอบใหม่จะอยู่หลังวันหมดอายุของรอบก่อนหน้า 1 วันเสมอ)
-function latestCertStart(records) {
-  const candidates = [];
-  for (const { type, rec } of records) {
-    if (type === 'initial' || type === 'recer') {
-      const t = parseThaiDate(rec.cerIssueDate);
-      if (t !== null) candidates.push({ t, dateStr: rec.cerIssueDate });
-    }
-  }
-  if (candidates.length === 0) return null;
-  candidates.sort((a, b) => b.t - a.t);
-  return candidates[0].dateStr;
+// หา record ที่ถือว่าเป็น "รอบปัจจุบัน" ของใบรับรอง เพื่อเอาวันที่เริ่ม/หมดอายุมาโชว์ - ใช้ตรรกะเดียวกับ buildLatestRoundSummary
+// คือ Recer ถือว่าใหม่กว่า Initial เสมอ (ถ้ามี Recer ให้ใช้ Recer รอบล่าสุดเป็นตัวอ้างอิง ไม่ใช้ Initial เก่าแทนแม้ Recer จะยังไม่กรอกวันที่ก็ตาม)
+// สำคัญ: ต้องยึดตาม "รอบที่ใหม่ที่สุดจริงๆ" ไม่ใช่ "รอบไหนก็ได้ที่บังเอิญมีวันที่กรอกไว้" ไม่งั้นถ้า Recer ยังไม่กรอกวันที่
+// จะเผลอไปดึงวันที่ของ Initial เก่ามาโชว์เป็นวันที่ "ปัจจุบัน" ซึ่งผิด (เจอจากเคสจริง เช่น DEE Q OLO ASSET)
+function pickCurrentCertRecord(records) {
+  const initials = records.filter((r) => r.type === 'initial').map((r) => r.rec);
+  const recers = records.filter((r) => r.type === 'recer').map((r) => r.rec);
+  const recerPick = pickLatestRecord(recers);
+  if (recerPick) return { rec: recerPick, type: 'recer' };
+  const initialPick = pickLatestRecord(initials);
+  if (initialPick) return { rec: initialPick, type: 'initial' };
+  return null; // ไม่มีทั้ง Initial และ Recer เลย (เช่น กลุ่มที่มีแต่ SU) - ไม่มี "รอบปัจจุบัน" ให้อ้างอิง
 }
 
-// วันที่ "ใบรับรองฉบับปัจจุบันหมดอายุ" - คู่กับ latestCertStart (เอาวันหมดอายุที่ล่าสุด จาก Initial (Cer Expire Date)
-// หรือ Recer (วันที่ cer จีนหมดอายุ) เท่านั้น) เพื่อให้สอดคล้องกับใบรับรองฉบับเดียวกับที่ certStart อ้างถึง
+// วันที่ "ใบรับรองฉบับปัจจุบันเริ่มมีผล" - ดูจาก Cer Issue Date ของรอบปัจจุบัน (Initial หรือ Recer ล่าสุด) เท่านั้น
+// ไม่ใช้วันที่ของ SU เลย เพราะ SU เป็นแค่การตรวจติดตามใบรับรองเดิม ไม่ได้ออกใบรับรองใหม่
+// ถ้ามีรอบปัจจุบันแต่ยังไม่ได้กรอกวันที่ไว้ ให้บอกตรงๆ ว่า "ไม่ได้บันทึก" (ไม่ใช่ไปเงียบๆ ดึงวันที่ของรอบเก่ากว่ามาแทน)
+// ถ้าไม่มีรอบปัจจุบันเลย (ไม่มีทั้ง Initial/Recer) คืน null เพื่อให้ฝั่งเรียกใช้ซ่อนบรรทัดนี้ไปเลย
+function latestCertStart(records) {
+  const current = pickCurrentCertRecord(records);
+  if (!current) return null;
+  return current.rec.cerIssueDate || 'ไม่ได้บันทึก';
+}
+
+// วันที่ "ใบรับรองฉบับปัจจุบันหมดอายุ" - คู่กับ latestCertStart ใช้รอบปัจจุบันเดียวกัน (Initial ใช้ Cer Expire Date,
+// Recer ใช้วันที่ cer จีนหมดอายุ/certExpireDate) เพื่อให้สอดคล้องกับใบรับรองฉบับเดียวกับที่ certStart อ้างถึงเสมอ
 function latestCertExpire(records) {
-  const candidates = [];
-  for (const { type, rec } of records) {
-    if (type === 'initial' && rec.cerExpireDate) {
-      const t = parseThaiDate(rec.cerExpireDate);
-      if (t !== null) candidates.push({ t, dateStr: rec.cerExpireDate });
-    } else if (type === 'recer' && rec.certExpireDate) {
-      const t = parseThaiDate(rec.certExpireDate);
-      if (t !== null) candidates.push({ t, dateStr: rec.certExpireDate });
-    }
-  }
-  if (candidates.length === 0) return null;
-  candidates.sort((a, b) => b.t - a.t);
-  return candidates[0].dateStr;
+  const current = pickCurrentCertRecord(records);
+  if (!current) return null;
+  const val = current.type === 'recer' ? current.rec.certExpireDate : current.rec.cerExpireDate;
+  return val || 'ไม่ได้บันทึก';
 }
 
 // คีย์สำหรับ "จัดกลุ่ม" ชื่อบริษัทเข้าด้วยกัน (คนละอันกับ companyNameParts().base ที่ใช้โชว์ผล)
@@ -559,7 +592,7 @@ function buildStatusReply(query) {
   const byCompany = new Map(); // "groupingKey::system" -> { displayName, baseKey, records }
   const withoutSystem = [];
   for (const r of results) {
-    const base = companyNameParts(r.rec.companyName).base;
+    const base = companyNameParts(r.rec.companyName, r.rec.system).base;
     const baseKey = groupingKey(base);
     const sysKey = normalizeSystem(r.rec.system);
     if (!sysKey) {
