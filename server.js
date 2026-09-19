@@ -299,9 +299,11 @@ function formatInProgress({ type, rec }, latestRound, certStart, certExpire) {
     if (su1Done && su2Done) return null; // ผ่านทั้ง SU1 และ SU2 แล้ว ถือว่าจบรอบนี้
     const lines = [`🔄 ${rec.companyName}`, `ระบบ: ${rec.system || '-'}`];
     // ถ้า SU1 ผ่านแล้ว แต่ SU2 ยังไม่มีข้อมูลอะไรเลยในไฟล์ (ยังไม่เริ่มตรวจ ไม่ใช่แค่ "ยังไม่เสร็จ")
-    // สรุปเป็นสถานะเดียวให้อ่านง่ายชัดเจนไปเลยว่า "ตรวจ SU1 เสร็จแล้ว รอตรวจ SU2" แทนที่จะโชว์ช่อง SU2 เป็น placeholder เฉยๆ
+    // สรุปเป็นสถานะเดียวให้อ่านง่ายชัดเจนไปเลยว่า "ตรวจ SU1 เสร็จแล้ว (วันที่...) รอตรวจ SU2" แทนที่จะโชว์ช่อง SU2 เป็น placeholder เฉยๆ
+    // ใส่วันที่ตรวจ SU1 (Cer. SU1 Date) ต่อท้ายด้วยถ้ามีข้อมูล
     if (su1Done && !su2Done && !rec.su2Status) {
-      lines.push(`สถานะ: ตรวจ SU1 เสร็จแล้ว รอตรวจ SU2`);
+      const su1DateText = rec.su1CertDate ? ` (${rec.su1CertDate})` : '';
+      lines.push(`สถานะ: ตรวจ SU1 เสร็จแล้ว${su1DateText} รอตรวจ SU2`);
     } else {
       // ถ้า SU1 ผ่านแล้วแต่ SU2 ยังไม่เสร็จ (มีข้อมูลบ้างแล้ว) โชว์เฉพาะ SU2 (ไม่โชว์ SU1 ที่ผ่านแล้วซ้ำ)
       // ระยะเวลาดำเนินการของแต่ละรอบ: นับจากวันที่ Sent Plan SU1/SU2 (เฉพาะรอบที่ Status มีข้อมูลแล้ว) ถึงวันนี้
@@ -470,7 +472,10 @@ function buildLatestRoundSummary(companyName, records) {
   ];
   if (rec.cerNo) lines.push(`เลขที่ใบรับรอง: ${rec.cerNo}`);
   if (rec.cerIssueDate) lines.push(`วันที่ออกใบรับรอง: ${rec.cerIssueDate}`);
-  if (rec.cerExpireDate) lines.push(`วันที่หมดอายุ: ${rec.cerExpireDate}`);
+  // ช่อง "วันหมดอายุ" ชื่อคอลัมน์ในไฟล์ไม่เหมือนกันระหว่าง Initial (cerExpireDate) กับ Recer (certExpireDate มี t เพิ่ม)
+  // ต้องเช็คทั้ง 2 ชื่อ ไม่งั้นถ้า rec ที่เลือกมาเป็น Recer จะดึงค่าไม่เจอ (ได้ undefined) แล้วเงียบๆ ไม่โชว์บรรทัดนี้เลย
+  const expireDate = rec.cerExpireDate || rec.certExpireDate;
+  if (expireDate) lines.push(`วันที่หมดอายุ: ${expireDate}`);
   return lines.join('\n');
 }
 
