@@ -13,6 +13,11 @@ const config = {
 };
 const ADMIN_PASSCODE = process.env.ADMIN_PASSCODE || 'changeme';
 const UPLOAD_PASSCODE = process.env.UPLOAD_PASSCODE || 'changeme123';
+// ใช้สำหรับฟีเจอร์ "แท็กชื่อบอทแล้วถามคำถามทั่วไป" - ใช้ Gemini API ของ Google ซึ่งมี free tier
+// (ไม่ต้องผูกบัตรเครดิต) ขอ API key ฟรีได้ที่ https://aistudio.google.com/apikey แล้วเอามาตั้งเป็น
+// ตัวแปรนี้ใน Railway ถ้าไม่ตั้งค่า ฟีเจอร์นี้จะปิดอยู่เฉยๆ (ฟีเจอร์อื่นในบอทยังใช้ได้ปกติ)
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
 
 // บอทตัวเดียวกันนี้ใช้ได้หลายกลุ่ม แยกบทบาทกันด้วย groupId
 // ถ้าไม่ตั้งค่า (เว้นว่างไว้) = เปิดใช้งานฟีเจอร์นั้นได้ทุกกลุ่ม (พฤติกรรมเดิม)
@@ -61,9 +66,141 @@ function loadDB() {
 function saveDB(db) {
   fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
   fs.writeFileSync(DB_PATH, JSON.stringify(db, null, 2));
+  gistDirty = true; // มีการเปลี่ยนแปลงข้อมูล รอบ backup ถัดไปจะส่งขึ้น Gist ให้
+}
+
+// ==== สำรองข้อมูลอัตโนมัติไป GitHub Gist (กันคะแนนหายตอน deploy ใหม่/รีสตาร์ท) ==================
+// โฮสต์ฟรีอย่าง Render มีดิสก์แบบไม่ถาวร (ephemeral) พอ deploy โค้ดใหม่หรือรีสตาร์ทเซิร์ฟเวอร์ ไฟล์
+// data/scores.json ในเครื่องจะถูกล้าง ฟีเจอร์นี้จะคอยสำรอง db ทั้งก้อน (คะแนนเกม, สัตว์เลี้ยง, ทุกอย่าง)
+// ขึ้น GitHub Gist ส่วนตัวเป็นระยะๆ แล้วดึงกลับมาคืนอัตโนมัติตอนบอทเริ่มทำงานใหม่ ถ้าเครื่องข้อมูลว่างเปล่า
+// (หรือของใน Gist ใหม่กว่า) — ต้องตั้งค่า GITHUB_GIST_TOKEN (Personal Access Token สโคป "gist") เป็น
+// Environment Variable ก่อนถึงจะเปิดใช้งาน ถ้าไม่ตั้งค่า ฟีเจอร์นี้จะปิดอยู่เฉยๆ บอทยังทำงานได้ปกติทุกอย่าง
+// (ดูวิธีสร้าง Token ในไฟล์ README.md)
+const GITHUB_GIST_TOKEN = process.env.GITHUB_GIST_TOKEN || '';
+const GIST_DESCRIPTION = 'line-quiz-bot database backup (auto-managed by the bot — do not delete)';
+const GIST_FILENAME = 'line-quiz-bot-db-backup.json';
+const GIST_BACKUP_INTERVAL_MS = 30 * 1000; // ส่งขึ้น Gist อย่างมากทุก 30 วินาทีเมื่อมีข้อมูลเปลี่ยนแปลง
+let gistId = null;
+let gistDirty = false;
+let gistSyncing = false;
+
+async function githubGistRequest(pathSuffix, options = {}) {
+  const res = await fetch(`https://api.github.com${pathSuffix}`, {
+    ...options,
+    headers: {
+      Authorization: `Bearer ${GITHUB_GIST_TOKEN}`,
+      Accept: 'application/vnd.github+json',
+      'User-Agent': 'line-quiz-bot',
+      'Content-Type': 'application/json',
+      ...(options.headers || {}),
+    },
+  });
+  if (!res.ok) {
+    const body = await res.text().catch(() => '');
+    throw new Error(`GitHub API ${res.status}: ${body.slice(0, 300)}`);
+  }
+  return res.json();
+}
+
+// หา Gist สำรองข้อมูลที่เคยสร้างไว้ (เทียบจาก description) ถ้ายังไม่เคยมีก็สร้างใหม่ให้เลย
+// ทำแบบนี้แทนการจำ Gist ID ไว้ใน Environment Variable เพื่อไม่ต้องให้ผู้ใช้ไปคัดลอก ID มาตั้งเองอีกขั้นตอน
+async function findOrCreateBackupGist() {
+  const gists = await githubGistRequest('/gists?per_page=100');
+  const existing = gists.find((g) => g.description === GIST_DESCRIPTION);
+  if (existing) return existing.id;
+  const created = await githubGistRequest('/gists', {
+    method: 'POST',
+    body: JSON.stringify({
+      description: GIST_DESCRIPTION,
+      public: false,
+      files: { [GIST_FILENAME]: { content: JSON.stringify({ _bootstrap: true }) } },
+    }),
+  });
+  return created.id;
+}
+
+async function fetchBackupFromGist(id) {
+  const gist = await githubGistRequest(`/gists/${id}`);
+  const file = gist.files && gist.files[GIST_FILENAME];
+  if (!file || !file.content) return null;
+  try {
+    return JSON.parse(file.content);
+  } catch (e) {
+    return null;
+  }
+}
+
+async function pushBackupToGist(id, dbSnapshot) {
+  await githubGistRequest(`/gists/${id}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ files: { [GIST_FILENAME]: { content: JSON.stringify(dbSnapshot, null, 2) } } }),
+  });
 }
 
 let db = loadDB();
+
+// ตอนเริ่มบอท: ถ้าตั้งค่า Token ไว้ ให้เช็ค/สร้าง Gist สำรอง แล้วกู้คืนข้อมูลกลับมาถ้าดิสก์ในเครื่องว่างเปล่า
+// (เช่นเพิ่ง deploy ใหม่) หรือถ้าของใน Gist ใหม่กว่าที่มีในเครื่อง — server จะเริ่มรับ request หลังจากขั้นตอนนี้
+// เสร็จเท่านั้น กันไม่ให้มีคนเล่นเกมแทรกเข้ามาก่อนกู้ข้อมูลเสร็จ
+let dbBackupReady = Promise.resolve();
+if (GITHUB_GIST_TOKEN) {
+  dbBackupReady = (async () => {
+    try {
+      const localHadData = fs.existsSync(DB_PATH);
+      gistId = await findOrCreateBackupGist();
+      const remote = await fetchBackupFromGist(gistId);
+      if (remote && remote._bootstrap !== true) {
+        const localTs = db._backupSavedAt || 0;
+        const remoteTs = remote._backupSavedAt || 0;
+        if (!localHadData || remoteTs > localTs) {
+          db = remote;
+          delete db._bootstrap;
+          saveDB(db);
+          gistDirty = false; // เพิ่งซิงค์มาตรงกันแล้ว ยังไม่ต้อง push กลับทันที
+          console.log('[gist-backup] restored database from GitHub Gist (local disk was empty or Gist copy was newer)');
+        }
+      }
+      console.log(`[gist-backup] enabled, using gist ${gistId} (auto-syncs every ~${GIST_BACKUP_INTERVAL_MS / 1000}s when data changes)`);
+    } catch (e) {
+      console.error('[gist-backup] setup failed, continuing WITHOUT auto-backup (bot still works normally):', e.message);
+      gistId = null;
+    }
+  })();
+}
+
+setInterval(async () => {
+  if (!gistId || !gistDirty || gistSyncing) return;
+  gistSyncing = true;
+  gistDirty = false;
+  try {
+    db._backupSavedAt = Date.now();
+    await pushBackupToGist(gistId, db);
+  } catch (e) {
+    console.error('[gist-backup] periodic push failed, will retry next round:', e.message);
+    gistDirty = true;
+  } finally {
+    gistSyncing = false;
+  }
+}, GIST_BACKUP_INTERVAL_MS);
+
+async function flushGistBackupBeforeExit(signal) {
+  if (!gistId) return;
+  try {
+    db._backupSavedAt = Date.now();
+    await pushBackupToGist(gistId, db);
+    console.log(`[gist-backup] flushed latest data to Gist before ${signal}`);
+  } catch (e) {
+    console.error(`[gist-backup] flush before ${signal} failed:`, e.message);
+  }
+}
+// Render (และโฮสต์อื่นๆ ส่วนใหญ่) จะส่งสัญญาณนี้มาก่อนจะปิด/สลับไปรันโค้ดเวอร์ชันใหม่ตอน deploy เสมอ
+// ดักไว้ให้ส่งข้อมูลล่าสุดขึ้น Gist ก่อนปิดตัวจริง จะได้ไม่มีช่วงเวลาสูญหายแม้แต่วินาทีเดียว
+['SIGTERM', 'SIGINT'].forEach((sig) => {
+  process.on(sig, async () => {
+    await flushGistBackupBeforeExit(sig);
+    process.exit(0);
+  });
+});
 
 async function getDisplayName(groupId, userId) {
   if (db.players[userId] && db.players[userId].name) return db.players[userId].name;
@@ -840,9 +977,16 @@ function seededNumber3(seedStr) {
 }
 
 // "วันนี้" อิงเวลาไทย (UTC+7) ไม่ใช่เวลาของ server เพื่อให้ดวงเปลี่ยนตอนเที่ยงคืนเมืองไทยจริงๆ
+function bangkokNow() {
+  return new Date(Date.now() + 7 * 60 * 60 * 1000);
+}
 function todayKeyBangkok() {
-  const bkk = new Date(Date.now() + 7 * 60 * 60 * 1000);
+  const bkk = bangkokNow();
   return `${bkk.getUTCFullYear()}-${bkk.getUTCMonth() + 1}-${bkk.getUTCDate()}`;
+}
+// เลขวัน (นับจาก epoch) ตามเวลาไทย ใช้ทำเลขคณิตเรื่องวัน (เช่น ข้ามไปกี่วันแล้ว) ได้ง่ายกว่า string
+function bangkokDayIndex() {
+  return Math.floor(bangkokNow().getTime() / 86400000);
 }
 
 // เลือกไพ่ของ "วันนี้" ให้ userId คนนี้ (deterministic ตามวันที่+userId เหมือนเดิม)
@@ -983,6 +1127,346 @@ async function handleWhoQuestion(event, groupId, userId, questionText) {
 }
 // ==== จบส่วนสุ่มคำตอบคำถาม /ใคร ====================================================
 
+// ==== แท็กชื่อบอทแล้วถามคำถามทั่วไป (คุยกับ Gemini API) ============================
+// เช็คว่าข้อความนี้ "แท็ก" บอทตัวเองหรือไม่ โดยดูจาก event.message.mention ที่ LINE ส่งมาให้
+// (ฟีเจอร์ mention ของ LINE เอง ไม่ใช่การเทียบชื่อบอทกับข้อความ จึงแม่นยำกว่า)
+// คืนค่าเป็นคำถามที่ตัดส่วน "@ชื่อบอท " ออกแล้ว หรือ null ถ้าข้อความนี้ไม่ได้แท็กบอท
+function extractQuestionIfMentioned(event) {
+  const mention = event.message.mention;
+  if (!mention || !Array.isArray(mention.mentionees)) return null;
+  const mentionsSelf = mention.mentionees.some((m) => m.isSelf);
+  if (!mentionsSelf) return null;
+
+  const text = event.message.text;
+  // ตัดข้อความส่วนที่เป็น mention (เช่น "@ชื่อบอท ") ออกทั้งหมด เหลือแต่คำถามจริงๆ
+  let question = '';
+  let lastIndex = 0;
+  const sorted = [...mention.mentionees].sort((a, b) => a.index - b.index);
+  for (const m of sorted) {
+    question += text.slice(lastIndex, m.index);
+    lastIndex = m.index + m.length;
+  }
+  question += text.slice(lastIndex);
+  return question.trim();
+}
+
+// เรียก Gemini API (free tier ของ Google) ให้ตอบคำถามทั่วไปแบบกระชับ เป็นภาษาไทย
+async function askGemini(question) {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(GEMINI_MODEL)}:generateContent?key=${GEMINI_API_KEY}`;
+  const systemInstruction =
+    'คุณเป็นผู้ช่วยตอบคำถามในกลุ่มไลน์ของออฟฟิศ ตอบให้กระชับ ตรงประเด็น ไม่ต้องยาวเกินจำเป็น ' +
+    'ใช้ภาษาไทยเป็นหลัก เว้นแต่ผู้ถามพิมพ์ถามเป็นภาษาอื่น ให้ตอบเป็นภาษานั้นแทน';
+  const body = {
+    system_instruction: { parts: [{ text: systemInstruction }] },
+    contents: [{ role: 'user', parts: [{ text: question }] }],
+  };
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const errText = await res.text().catch(() => '');
+    throw new Error(`Gemini API ${res.status}: ${errText.slice(0, 300)}`);
+  }
+  const data = await res.json();
+  const answer = data?.candidates?.[0]?.content?.parts?.map((p) => p.text).join('') || '';
+  return answer.trim();
+}
+// ==== จบส่วนถามคำถามทั่วไป ==========================================================
+
+// ==== เกมเลี้ยงสัตว์เลี้ยง (Tamagotchi) ==============================================
+// แต่ละคนมีสัตว์เลี้ยงของตัวเอง (เก็บใน db.pets[userId]) ต้องดูแล (ให้อาหาร) วันละ 2 ช่วงตามเวลาไทยจริง
+// เช้า 06:00-12:00 น. / บ่าย 12:01-18:00 น. (นอกช่วงนี้ป้อนอาหารไม่ได้) สะสม "พลังชีวิต" (lifeForce)
+// เป็นแต้มสะสมไม่มีเพดาน ใช้เป็นตัวตัดสินระยะการเติบโต — กด /ให้อาหาร
+// แต่ละรอบ (เช้าหรือบ่าย) ได้ +25 แต้มทันที ดูแลครบทั้งวันเท่ากับ +50 แต้ม ไม่มีโทษ ดูแลครึ่งวัน
+// (แค่เช้าหรือแค่บ่าย) ก็ได้ +25 เฉยๆ ไม่มีโทษเช่นกัน แต่ถ้าขาดดูแลไปเลยทั้งวัน (ไม่ป้อนอาหารแม้แต่รอบเดียว)
+// จะโดนหักท้ายวัน -20 แต้ม (พื้นที่ 0 ไม่ติดลบ) ขาดดูแลทั้งวันติดกัน
+// 2 วันขึ้นไปจะป่วยทันที ป้อนยาแล้วหายได้เสมอ (ไม่มีตายถาวร) ระยะการเติบโตไม่มีวันถอยกลับแม้แต้มจะลดลง
+// ภายหลังจากถูกปล่อยละเลย นอกจากนี้บอทจะสุ่ม "เหตุการณ์พิเศษ" push เข้ากลุ่มวันละ 4 รอบ (เวลาสุ่มระหว่าง
+// 08:30-17:00 น.) เป็นเกม "พิมพ์ตามให้ตรงเป๊ะ" เปิดให้ทุกคนในกลุ่มแข่งกัน แต่ละรอบจำกัดเวลา 1 นาที
+// 5 คนแรกที่พิมพ์ถูกได้ +30 แต้ม คนที่เหลือได้ +10 แต้ม แล้วบอทจะแจ้งหมดเวลาเมื่อครบ 1 นาที
+// รวมใช้ประมาณ 240 ข้อความ push/เดือน (แพ็กเกจฟรีของไทยมี 300 ข้อความ/เดือน ยังพอมีเผื่อฟีเจอร์อื่น)
+
+const PET_SPECIES = [
+  '🐶 หมาน้อย', '🐱 แมวเหมียว', '🐰 กระต่าย', '🐹 แฮมสเตอร์', '🐼 แพนด้า',
+  '🐧 เพนกวิน', '🦊 จิ้งจอก', '🐢 เต่า', '🐥 ลูกเจี๊ยบ', '🐸 กบ',
+];
+
+// ลำดับระยะการเติบโต (เรียงจากน้อยไปมาก) ใช้เทียบอันดับเพื่อการันตีว่าสเตจไม่มีวันถอยกลับ
+const PET_STAGE_ORDER = ['egg', 'baby', 'child', 'teen', 'adult', 'breed', 'old', 'legend'];
+
+const PET_STAGE_LABEL = {
+  egg: 'ไข่ลึกลับ 🥚',
+  baby: 'ลูก (Baby) 🐣',
+  child: 'เด็ก (Child) 🌱',
+  teen: 'วัยรุ่น (Teen) 🌿',
+  adult: 'โตเต็มวัย (Adult) 🎊',
+  breed: 'พร้อมสืบพันธุ์ (Breeding) 💕',
+  old: 'แก่จัด (Old) 👴',
+  legend: 'ตำนาน (Legend) 👑',
+};
+
+// เกณฑ์แต้มพลังชีวิตสะสม (lifeForce) ต่อระยะการเติบโต
+function petStageFromLifeForce(points) {
+  if (points >= 15000) return 'legend';
+  if (points >= 7500) return 'old';
+  if (points >= 4000) return 'breed';
+  if (points >= 2000) return 'adult';
+  if (points >= 1000) return 'teen';
+  if (points >= 400) return 'child';
+  if (points >= 50) return 'baby';
+  return 'egg';
+}
+
+// อัปเดต pet.stage เฉพาะตอนที่ระยะใหม่ "สูงกว่า" ระยะเดิมเท่านั้น (การันตีไม่มีวันถอยกลับ
+// แม้ lifeForce จะลดลงภายหลังจากถูกปล่อยละเลย)
+function advancePetStageIfHigher(pet) {
+  const candidate = petStageFromLifeForce(pet.lifeForce);
+  if (PET_STAGE_ORDER.indexOf(candidate) > PET_STAGE_ORDER.indexOf(pet.stage)) {
+    pet.stage = candidate;
+  }
+}
+
+function adoptPet(name) {
+  return {
+    name,
+    species: PET_SPECIES[Math.floor(Math.random() * PET_SPECIES.length)],
+    stage: 'egg',
+    lifeForce: 0,
+    sick: false,
+    missedDaysInRow: 0,
+    caredToday: { morning: false, afternoon: false },
+    currentDayIndex: bangkokDayIndex(),
+    adoptedAt: Date.now(),
+  };
+}
+
+// ปิดวันของสัตว์เลี้ยง 1 วัน ตามผลการดูแลของวันนั้น (caredToday ก่อนถูกรีเซ็ต)
+// หมายเหตุ: แต้ม +25 ต่อรอบ (เช้า/บ่าย) ให้ทันทีตอนกด /ให้อาหาร แล้ว (ดู feedPet ด้านล่าง) ตรงนี้จัดการ
+// เฉพาะ "โทษ" ของการดูแลไม่ครบวันเท่านั้น (ดูแลครบทั้งวันจะไม่มีโทษ เพราะได้แต้มครบ 25+25=50 ไปแล้ว)
+function applyPetDailyRollover(pet) {
+  const { morning, afternoon } = pet.caredToday;
+  if (morning && afternoon) {
+    pet.missedDaysInRow = 0;
+  } else if (morning || afternoon) {
+    // ดูแลแค่ครึ่งวัน ยังได้ +25 จากตอนกด /ให้อาหาร ไปแล้ว ไม่มีโทษเพิ่ม แค่รีเซ็ตตัวนับวันขาดเพราะทำอะไรบ้างแล้ว
+    pet.missedDaysInRow = 0;
+  } else {
+    // ขาดดูแลไปเลยทั้งวัน (ไม่ป้อนอาหารแม้แต่รอบเดียว) ถึงจะโดนหักพลังชีวิต
+    pet.lifeForce = Math.max(0, pet.lifeForce - 20);
+    pet.missedDaysInRow += 1;
+  }
+  if (pet.missedDaysInRow >= 2) pet.sick = true;
+  advancePetStageIfHigher(pet);
+  pet.currentDayIndex += 1;
+  pet.caredToday = { morning: false, afternoon: false };
+}
+
+// ไล่ปิดวันที่ค้างอยู่ทั้งหมดให้ทันวันปัจจุบัน (เผื่อ server ปิดไปหลายวัน หรือไม่มีใครพิมพ์อะไรเลย)
+function advancePetDays(pet) {
+  const today = bangkokDayIndex();
+  let guard = 0;
+  while (pet.currentDayIndex < today && guard < 3650) {
+    applyPetDailyRollover(pet);
+    guard += 1;
+  }
+}
+
+// รอบ "เช้า" คือ 06:00-12:00 น. รอบ "บ่าย" คือ 12:01-18:00 น. (เวลาไทย) นอกช่วงนี้ (18:01-05:59) ป้อนอาหารไม่ได้
+function petSessionNow() {
+  const bkk = bangkokNow();
+  const hour = bkk.getUTCHours() + bkk.getUTCMinutes() / 60;
+  if (hour >= 6 && hour < 12) return 'morning';
+  if (hour >= 12 && hour < 18) return 'afternoon';
+  return null;
+}
+
+function feedPet(pet) {
+  advancePetDays(pet);
+  const session = petSessionNow();
+  if (!session) {
+    return { ok: false, reason: 'outside_hours' };
+  }
+  if (pet.caredToday.morning && pet.caredToday.afternoon) {
+    return { ok: false, reason: 'already_fed_today' };
+  }
+  if (pet.caredToday[session]) {
+    return { ok: false, reason: 'already_fed_this_session', session };
+  }
+  pet.caredToday[session] = true;
+  pet.lifeForce = Math.max(0, pet.lifeForce + 25); // กดป้อนอาหาร ได้ +25 คะแนนทันที ง่ายๆ/รอบ (เช้าหรือบ่าย)
+  advancePetStageIfHigher(pet);
+  return { ok: true, session };
+}
+
+function givePetMedicine(pet) {
+  advancePetDays(pet);
+  if (!pet.sick) return { ok: false, reason: 'not_sick' };
+  pet.sick = false;
+  pet.missedDaysInRow = 0;
+  return { ok: true };
+}
+
+function formatPetStatus(pet) {
+  const careTodayText =
+    pet.caredToday.morning || pet.caredToday.afternoon
+      ? `วันนี้: ${pet.caredToday.morning ? '✅ เช้า' : '⬜ เช้า'} ${pet.caredToday.afternoon ? '✅ บ่าย' : '⬜ บ่าย'}`
+      : 'วันนี้ยังไม่ได้ดูแลเลย พิมพ์ /ให้อาหาร ได้เลยครับ';
+  return [
+    `${pet.species} "${pet.name}"`,
+    `ระยะการเติบโต: ${PET_STAGE_LABEL[pet.stage]}`,
+    `พลังชีวิตสะสม: ${pet.lifeForce} คะแนน`,
+    pet.sick ? '🤒 กำลังป่วยอยู่ พิมพ์ /ป้อนยา ด่วน!' : '💚 สุขภาพแข็งแรงดี',
+    careTodayText,
+  ].join('\n');
+}
+
+// สุ่มเวลาช่วงหนึ่งของวัน (เวลาไทย) สำหรับ dayIndex ที่กำหนด ระหว่าง startHour-endHour (เป็นทศนิยมชั่วโมงได้)
+function pickRandomTimeInWindow(dayIndex, startHour, endHour) {
+  const bangkokMidnightUtcMs = dayIndex * 86400000 - 7 * 60 * 60 * 1000;
+  const startMs = bangkokMidnightUtcMs + startHour * 60 * 60 * 1000;
+  const endMs = bangkokMidnightUtcMs + endHour * 60 * 60 * 1000;
+  return startMs + Math.random() * (endMs - startMs);
+}
+
+// ---- เหตุการณ์พิเศษ (สุ่มวันละ 4 รอบ เป็นเกม "พิมพ์ตามให้ตรงเป๊ะ" เปิดให้ทุกคนในกลุ่มแข่งกัน) ----
+const PET_EVENT_WINDOW_START_HOUR = 8.5; // 08:30 น.
+const PET_EVENT_WINDOW_END_HOUR = 17; // 17:00 น.
+const PET_EVENT_ROUNDS_PER_DAY = 4;
+const PET_CHALLENGE_ROUND_MS = 60 * 1000; // แต่ละรอบเปิดให้แข่ง 1 นาที พิมพ์หลังจากนี้ไม่ได้คะแนน
+const PET_CHALLENGE_TOP_SLOTS = 5; // 5 คนแรกที่พิมพ์ถูก
+const PET_CHALLENGE_TOP_POINTS = 30; // ...ได้คนละ 30 คะแนน
+const PET_CHALLENGE_REST_POINTS = 10; // คนที่เหลือ (ถ้าพิมพ์ถูกทันภายใน 1 นาที) ได้คนละ 10 คะแนน
+
+// เก็บเฉพาะข้อความ (ไม่ผูกกับคำสั่งใดๆ แล้ว) แบ่งหมวดไว้แค่ให้เลือกโทนข้อความตอนสุ่มเฉยๆ
+const PET_EVENT_HOOKS = {
+  feed_extra: [
+    'หิวจัง ขอเพิ่มอีกคำ', 'ท้องร้องจ๊อกๆ ป้อนหน่อยสิ', 'ขอขนมเพิ่ม อีกนิดนะ',
+    'แอบหิว มาป้อนหน่อยได้ไหม', 'ท้องยังไม่อิ่มเลย ป้อนอีกที', 'อยากกินของอร่อย เพิ่มอีก',
+    'ขอข้าวเพิ่ม อีกจานนะ', 'หิวอีกแล้ว มาป้อนหน่อย', 'ขอของว่าง เพิ่มหน่อยจ้า',
+    'พลังงานหมด ขอเติมหน่อย', 'อยากกินอีกคำ ด่วนเลย', 'ท้องกิ๋วๆ ป้อนหน่อยนะ',
+    'หิวสุดๆ ช่วยป้อนที',
+  ],
+  walk: [
+    'อยากออกไปเดินเล่น จัง', 'เบื่อจัง พาไปเดินหน่อย', 'ขาคัน อยากวิ่งเล่น',
+    'อยากสูดอากาศ ข้างนอกบ้าง', 'พาไปเที่ยว หน่อยได้ไหม', 'อยากยืดเส้น ยืดสาย',
+    'นั่งเฉยมานาน พาไปเดิน', 'อยากไปดู โลกกว้าง', 'ขอออกกำลังกาย หน่อยนะ',
+    'เหงาแล้ว พาไปเที่ยวสิ', 'อยากไปเล่น ข้างนอกบ้าง', 'พาไปดมกลิ่นหญ้า หน่อย',
+    'คิดถึงสวน พาไปเดินที',
+  ],
+  cuddle: [
+    'อยากให้อุ้ม จังเลย', 'ขอกอดหน่อย ได้ไหม', 'คิดถึงจัง มาอุ้มหน่อย',
+    'อยากอ้อน เจ้าของหน่อย', 'ขอความรัก หน่อยนะ', 'อยากนอนตัก เจ้าของ',
+    'มาหอมแก้ม หน่อยสิ', 'อยากให้ลูบหัว หน่อย', 'เหงาๆ อยากให้กอด',
+    'ขออ้อน สักครู่นะ', 'อยากให้เอาใจ หน่อย', 'มากอดกัน หน่อยไหม',
+  ],
+  sick: [
+    'รู้สึกไม่ค่อยสบาย เลย', 'เวียนหัว ขอยาหน่อย', 'ท้องไส้ปั่นป่วน จัง',
+    'ตัวร้อนๆ เหมือนจะไม่สบาย', 'ปวดหัวนิดๆ ขอยาที', 'รู้สึกอ่อนเพลีย มาก',
+    'ไม่ค่อยมีแรง เลย', 'แอบป่วย นิดหน่อยนะ', 'รู้สึกซึมๆ ไม่สดใส',
+    'ขอยาหน่อย ไม่ค่อยไหว', 'ตัวโย้เย้ ไม่ค่อยดี', 'เหมือนจะไข้ขึ้น นะ',
+  ],
+};
+
+function pickPetEventTimes(dayIndex) {
+  const sliceLen = (PET_EVENT_WINDOW_END_HOUR - PET_EVENT_WINDOW_START_HOUR) / PET_EVENT_ROUNDS_PER_DAY;
+  const times = [];
+  for (let i = 0; i < PET_EVENT_ROUNDS_PER_DAY; i++) {
+    const startHour = PET_EVENT_WINDOW_START_HOUR + i * sliceLen;
+    times.push(pickRandomTimeInWindow(dayIndex, startHour, startHour + sliceLen));
+  }
+  return times;
+}
+
+// สุ่มข้อความ 1 อย่าง แล้ว push ชวนทุกคนในกลุ่มแข่งพิมพ์ตามให้ตรงเป๊ะ (จำกัดเวลา 1 นาที เปิดให้ได้หลายคน)
+async function triggerPetEvent() {
+  if (!db.groupId || !db.pets) return;
+  if (Object.keys(db.pets).length === 0) return; // ยังไม่มีใครเลี้ยงสัตว์เลี้ยงเลยในกลุ่มนี้ ไม่ต้องส่ง
+  const kinds = Object.keys(PET_EVENT_HOOKS);
+  const kind = kinds[Math.floor(Math.random() * kinds.length)];
+  const hooks = PET_EVENT_HOOKS[kind];
+  const hookText = hooks[Math.floor(Math.random() * hooks.length)];
+  db.petChallenge = { hookText, kind, startedAt: Date.now(), winners: [], timeUpAnnounced: false };
+  saveDB(db);
+  const text = [
+    '🎲 เหตุการณ์พิเศษ! มีเสียงจากสัตว์เลี้ยงในกลุ่มดังขึ้นว่า...',
+    `"${hookText}"`,
+    `ใครพิมพ์ข้อความนี้ตามให้ตรงเป๊ะได้ก่อน ภายใน 1 นาที! ${PET_CHALLENGE_TOP_SLOTS} คนแรกได้ +${PET_CHALLENGE_TOP_POINTS} คะแนน คนที่เหลือได้ +${PET_CHALLENGE_REST_POINTS} คะแนน`,
+    '(ต้องมีสัตว์เลี้ยงของตัวเองก่อนถึงจะรับรางวัลได้ — หมดเวลา 1 นาทีแล้วพิมพ์ถูกจะไม่ได้คะแนนนะ)',
+  ].join('\n');
+  try {
+    await client.pushMessage(db.groupId, { type: 'text', text });
+  } catch (e) {
+    console.error('pet event push failed:', e.originalError?.response?.data || e.message);
+  }
+}
+
+// เรียกทุกข้อความที่เข้ามาในกลุ่ม เช็คว่าตรงกับเหตุการณ์พิเศษที่ค้างอยู่แบบตรงเป๊ะหรือไม่ (ภายใน 1 นาที)
+// คืนค่า null ถ้าไม่ตรง/ไม่มีเหตุการณ์/หมดเวลาแล้ว/คนนี้ได้รางวัลรอบนี้ไปแล้ว, { noPet: true } ถ้าตรงแต่คนพิมพ์
+// ยังไม่มีสัตว์เลี้ยง (กรณีนี้ไม่กินสิทธิ์ ให้คนอื่นแข่งต่อได้), หรือ { points, rank, pet } เมื่อได้รางวัลสำเร็จ
+function tryClaimPetChallenge(userId, rawText) {
+  const ch = db.petChallenge;
+  if (!ch) return null;
+  if (Date.now() - ch.startedAt > PET_CHALLENGE_ROUND_MS) return null; // หมดเวลารอบพิเศษแล้ว
+  if (rawText.trim() !== ch.hookText) return null;
+  if (ch.winners.includes(userId)) return null; // คนนี้ได้รางวัลรอบนี้ไปแล้ว พิมพ์ซ้ำไม่ได้เพิ่ม
+  if (!db.pets || !db.pets[userId]) return { noPet: true };
+  const rank = ch.winners.length; // อันดับก่อนเพิ่มคนนี้ (0-based)
+  const points = rank < PET_CHALLENGE_TOP_SLOTS ? PET_CHALLENGE_TOP_POINTS : PET_CHALLENGE_REST_POINTS;
+  ch.winners.push(userId);
+  const pet = db.pets[userId];
+  advancePetDays(pet);
+  pet.lifeForce = Math.max(0, pet.lifeForce + points);
+  advancePetStageIfHigher(pet);
+  return { points, rank: rank + 1, pet };
+}
+
+// เช็คว่ารอบเหตุการณ์พิเศษที่ค้างอยู่ครบ 1 นาทีหรือยัง ถ้าครบแล้วยังไม่ได้แจ้ง ให้ push บอกหมดเวลา
+async function checkPetChallengeExpiry() {
+  const ch = db.petChallenge;
+  if (!ch || ch.timeUpAnnounced) return;
+  if (Date.now() - ch.startedAt < PET_CHALLENGE_ROUND_MS) return;
+  ch.timeUpAnnounced = true;
+  saveDB(db);
+  const text =
+    ch.winners.length > 0
+      ? `⏰ หมดเวลารอบพิเศษแล้วครับ! รอบนี้มีคนพิมพ์ถูกทันเวลาทั้งหมด ${ch.winners.length} คน 🎉`
+      : '⏰ หมดเวลารอบพิเศษแล้วครับ ไม่มีใครพิมพ์ถูกทันเลย รอบหน้ามาลองใหม่นะ!';
+  try {
+    await client.pushMessage(db.groupId, { type: 'text', text });
+  } catch (e) {
+    console.error('pet challenge time-up push failed:', e.originalError?.response?.data || e.message);
+  }
+}
+
+// เช็คทุก 1 นาทีว่าถึงเวลาที่สุ่มไว้ของวันนี้ (4 รอบ) หรือยัง ถ้าถึงแล้วค่อยส่งเหตุการณ์พิเศษ
+// เก็บเวลาที่สุ่มไว้ใน db ด้วย กัน server รีสตาร์ทแล้วสุ่มเวลาใหม่/ส่งซ้ำ พร้อมเช็คปิดรอบที่หมดเวลาไปด้วย
+async function petSchedulerTick() {
+  const dayIndex = bangkokDayIndex();
+  if (!db.petSchedule || db.petSchedule.dayIndex !== dayIndex) {
+    db.petSchedule = {
+      dayIndex,
+      times: pickPetEventTimes(dayIndex),
+      sent: new Array(PET_EVENT_ROUNDS_PER_DAY).fill(false),
+    };
+    saveDB(db);
+  }
+  const now = Date.now();
+  for (let i = 0; i < db.petSchedule.times.length; i++) {
+    if (!db.petSchedule.sent[i] && now >= db.petSchedule.times[i]) {
+      db.petSchedule.sent[i] = true;
+      saveDB(db);
+      await triggerPetEvent();
+    }
+  }
+  await checkPetChallengeExpiry();
+}
+setInterval(() => {
+  petSchedulerTick().catch((e) => console.error('petSchedulerTick error:', e.message));
+}, 60 * 1000);
+// ==== จบส่วนเกมเลี้ยงสัตว์เลี้ยง ======================================================
+
 async function handleEvent(event) {
   if (event.type !== 'message' || event.message.type !== 'text') return;
   if (event.source.type !== 'group') return; // ใช้งานเฉพาะในกลุ่มไลน์ปกติเท่านั้น
@@ -1000,6 +1484,45 @@ async function handleEvent(event) {
   ensureGroupMemberCached(groupId, userId).catch(() => {});
 
   // ---- ใครก็พิมพ์ได้ ทุกกลุ่ม ----
+
+  // เกมพิมพ์ตามเหตุการณ์พิเศษของสัตว์เลี้ยง (เช็คก่อนสุด เพราะข้อความที่พิมพ์ตามไม่ใช่คำสั่ง /)
+  // ถ้าข้อความไม่ตรงกับเหตุการณ์ที่ค้างอยู่แบบเป๊ะๆ จะคืนค่า null แล้วปล่อยผ่านไปเช็คคำสั่งอื่นตามปกติ
+  const petClaim = tryClaimPetChallenge(userId, text);
+  if (petClaim) {
+    if (petClaim.noPet) {
+      await reply(event, '🐾 พิมพ์ถูกแล้วครับ! แต่ต้องมีสัตว์เลี้ยงของตัวเองก่อนถึงจะรับรางวัลได้ พิมพ์ "/รับเลี้ยง <ชื่อ>" ไว้เลย เผื่อรอบหน้า');
+      return;
+    }
+    saveDB(db);
+    const winnerName = (db.groupMembers && db.groupMembers[groupId] && db.groupMembers[groupId][userId]) || 'คุณ';
+    await reply(
+      event,
+      `✅ ${winnerName} พิมพ์ถูกเป็นคนที่ ${petClaim.rank}! ${petClaim.pet.species} "${petClaim.pet.name}" ได้พลังชีวิต +${petClaim.points} คะแนน (สะสม ${petClaim.pet.lifeForce})`
+    );
+    return;
+  }
+
+  // แท็กชื่อบอทแล้วถามคำถามทั่วไปได้เลย (เช็คก่อนคำสั่งอื่นๆ เพราะข้อความมักมีคำถามต่อท้าย ไม่ใช่คำสั่ง /)
+  const mentionQuestion = extractQuestionIfMentioned(event);
+  if (mentionQuestion !== null) {
+    if (!GEMINI_API_KEY) {
+      await reply(event, 'ฟีเจอร์ถามตอบทั่วไปยังไม่ได้ตั้งค่าไว้ครับ (แอดมินต้องตั้งค่า GEMINI_API_KEY ใน Railway ก่อน ขอฟรีได้ที่ aistudio.google.com/apikey)');
+      return;
+    }
+    if (!mentionQuestion) {
+      await reply(event, 'แท็กมาแล้วพิมพ์คำถามต่อท้ายด้วยนะครับ เช่น "@ชื่อบอท วันนี้วันอะไร"');
+      return;
+    }
+    try {
+      const answer = await askGemini(mentionQuestion);
+      await reply(event, answer || 'ขอโทษครับ ตอบคำถามนี้ไม่ได้ ลองถามใหม่อีกครั้งนะครับ');
+    } catch (e) {
+      console.error('askGemini failed:', e.message);
+      await reply(event, 'ขอโทษครับ ตอนนี้ตอบคำถามไม่ได้ (ระบบขัดข้องหรือโควต้าฟรีเต็ม) ลองใหม่อีกครั้งนะครับ');
+    }
+    return;
+  }
+
   if (/^\/whoami$/i.test(text)) {
     await reply(event, `userId ของคุณ: ${userId}`);
     return;
@@ -1007,6 +1530,26 @@ async function handleEvent(event) {
 
   if (/^\/groupid$/i.test(text)) {
     await reply(event, `groupId ของกลุ่มนี้คือ:\n${groupId}\n\n(เอาไปตั้งเป็น QUIZ_GROUP_ID หรือ STATUS_GROUP_ID ใน Railway ได้)`);
+    return;
+  }
+
+  // เช็คสถานะระบบสำรองข้อมูลอัตโนมัติ (กันคะแนน/สัตว์เลี้ยงหายตอน deploy ใหม่หรือรีสตาร์ท)
+  if (/^\/(backup|สำรอง)$/i.test(text)) {
+    if (!GITHUB_GIST_TOKEN) {
+      await reply(event, '⚠️ ยังไม่ได้เปิดระบบสำรองข้อมูลอัตโนมัติ (ไม่ได้ตั้งค่า GITHUB_GIST_TOKEN) ข้อมูลอาจหายได้ถ้ามีการ deploy ใหม่หรือรีสตาร์ทเซิร์ฟเวอร์ ดูวิธีตั้งค่าได้ใน README.md');
+      return;
+    }
+    if (!gistId) {
+      await reply(event, '⚠️ ตั้งค่า Token ไว้แล้ว แต่ระบบสำรองข้อมูลเชื่อมต่อ GitHub ไม่สำเร็จ (อาจเพราะ Token ผิดหรือหมดอายุ) เช็ค Logs ของเซิร์ฟเวอร์เพื่อดูรายละเอียด');
+      return;
+    }
+    const savedText = db._backupSavedAt
+      ? new Date(db._backupSavedAt + 7 * 3600 * 1000).toISOString().replace('T', ' ').slice(0, 19) + ' น. (เวลาไทย)'
+      : 'ยังไม่เคยสำรองข้อมูลรอบแรกเลย (รอ ~30 วินาทีหลังมีการเปลี่ยนแปลงข้อมูลครั้งแรก)';
+    await reply(
+      event,
+      `✅ ระบบสำรองข้อมูลอัตโนมัติเปิดใช้งานอยู่\nสำรองข้อมูลล่าสุดเมื่อ: ${savedText}\nยังไม่ได้สำรองรอบล่าสุด: ${gistDirty ? 'มี (รอรอบถัดไป)' : 'ไม่มี ข้อมูลตรงกันแล้ว'}`
+    );
     return;
   }
 
@@ -1053,6 +1596,103 @@ async function handleEvent(event) {
     db.fortuneChecks[userId] = dayKey;
     saveDB(db);
     await replyMessages(event, buildDailyFortuneMessages(userId));
+    return;
+  }
+
+  // เกมเลี้ยงสัตว์เลี้ยง - ใช้ได้ทุกคน ทุกกลุ่ม
+  const adoptMatch = text.match(/^\/(?:รับเลี้ยง|เลี้ยงสัตว์)\s*(.*)$/i);
+  if (adoptMatch) {
+    if (!db.pets) db.pets = {};
+    const existing = db.pets[userId];
+    if (existing) {
+      await reply(event, `คุณมีสัตว์เลี้ยงอยู่แล้วนะครับ: ${existing.species} "${existing.name}" พิมพ์ /สัตว์เลี้ยง เพื่อดูสถานะได้เลย`);
+      return;
+    }
+    const name = adoptMatch[1].trim();
+    if (!name) {
+      await reply(event, 'ตั้งชื่อสัตว์เลี้ยงด้วยครับ เช่น "/รับเลี้ยง โมจิ"');
+      return;
+    }
+    db.pets[userId] = adoptPet(name);
+    saveDB(db);
+    await reply(
+      event,
+      `🎉 ยินดีด้วย! คุณได้รับเลี้ยง ${db.pets[userId].species} ชื่อ "${name}" แล้ว\n` +
+        'ตอนนี้ยังเป็นไข่ลึกลับอยู่ ดูแลให้ครบทุกวัน (เช้า+บ่าย) เดี๋ยวจะฟักออกมาเอง แล้วค่อยๆ โตขึ้นเรื่อยๆ\n' +
+        'พิมพ์ /ให้อาหาร ตอนบอทเตือน หรือเมื่อไหร่ก็ได้ที่นึกขึ้นได้ครับ (พิมพ์ /สัตว์เลี้ยง เพื่อดูสถานะได้ตลอด)'
+    );
+    return;
+  }
+
+  if (/^\/(ให้อาหาร|ป้อนข้าว|ป้อนอาหาร)$/i.test(text)) {
+    if (!db.pets || !db.pets[userId]) {
+      await reply(event, 'คุณยังไม่มีสัตว์เลี้ยงนะครับ พิมพ์ "/รับเลี้ยง <ชื่อ>" เพื่อเริ่มเลี้ยงได้เลย');
+      return;
+    }
+    const pet = db.pets[userId];
+    const result = feedPet(pet);
+    saveDB(db);
+    if (!result.ok) {
+      if (result.reason === 'outside_hours') {
+        await reply(event, `ตอนนี้อยู่นอกช่วงเวลาป้อนอาหารครับ ป้อนได้แค่ช่วงเช้า (06:00-12:00 น.) หรือช่วงบ่าย (12:01-18:00 น.) เท่านั้น`);
+        return;
+      }
+      if (result.reason === 'already_fed_this_session') {
+        const sessionLabel = result.session === 'morning' ? 'ช่วงเช้า' : 'ช่วงบ่าย';
+        await reply(event, `${pet.species} "${pet.name}" ป้อนอาหาร${sessionLabel}ไปแล้วครับ อีกรอบรอช่วงถัดไปนะ`);
+        return;
+      }
+      await reply(event, `${pet.species} "${pet.name}" วันนี้ดูแลครบ 2 รอบแล้วครับ พรุ่งนี้ค่อยมาใหม่นะ`);
+      return;
+    }
+    const sessionLabel = result.session === 'morning' ? 'ช่วงเช้า' : 'ช่วงบ่าย';
+    await reply(
+      event,
+      `🍚 ป้อนอาหาร${sessionLabel}ให้ ${pet.species} "${pet.name}" เรียบร้อย! ได้พลังชีวิต +25 คะแนน (สะสม ${pet.lifeForce})${pet.sick ? ' (แต่ยังป่วยอยู่ อย่าลืม /ป้อนยา ด้วยนะ)' : ' 😊'}`
+    );
+    return;
+  }
+
+  if (/^\/ป้อนยา$/i.test(text)) {
+    if (!db.pets || !db.pets[userId]) {
+      await reply(event, 'คุณยังไม่มีสัตว์เลี้ยงนะครับ พิมพ์ "/รับเลี้ยง <ชื่อ>" เพื่อเริ่มเลี้ยงได้เลย');
+      return;
+    }
+    const pet = db.pets[userId];
+    const result = givePetMedicine(pet);
+    saveDB(db);
+    if (!result.ok) {
+      await reply(event, `${pet.species} "${pet.name}" ไม่ได้ป่วยนะครับ ไม่ต้องป้อนยา`);
+      return;
+    }
+    await reply(event, `💊 ป้อนยาให้ ${pet.species} "${pet.name}" แล้ว หายป่วยแล้วครับ!`);
+    return;
+  }
+
+  if (/^\/(สัตว์เลี้ยง|เพ็ท|pet)$/i.test(text)) {
+    if (!db.pets || !db.pets[userId]) {
+      await reply(event, 'คุณยังไม่มีสัตว์เลี้ยงนะครับ พิมพ์ "/รับเลี้ยง <ชื่อ>" เพื่อเริ่มเลี้ยงได้เลย');
+      return;
+    }
+    const pet = db.pets[userId];
+    advancePetDays(pet);
+    saveDB(db);
+    await reply(event, formatPetStatus(pet));
+    return;
+  }
+
+  if (/^\/(สัตว์เลี้ยงกลุ่ม|เพ็ทกลุ่ม)$/i.test(text)) {
+    if (!db.pets || Object.keys(db.pets).length === 0) {
+      await reply(event, 'ยังไม่มีใครเลี้ยงสัตว์เลี้ยงในกลุ่มนี้เลยครับ พิมพ์ "/รับเลี้ยง <ชื่อ>" เป็นคนแรกได้เลย');
+      return;
+    }
+    const rows = Object.entries(db.pets).map(([uid, pet]) => {
+      advancePetDays(pet);
+      const name = (db.groupMembers && db.groupMembers[groupId] && db.groupMembers[groupId][uid]) || 'สมาชิก';
+      return `${pet.sick ? '🤒' : '💚'} ${name}: ${pet.species} "${pet.name}" (${PET_STAGE_LABEL[pet.stage]}, พลังชีวิต ${pet.lifeForce} คะแนน)`;
+    });
+    saveDB(db);
+    await reply(event, '🐾 สัตว์เลี้ยงในกลุ่มนี้:\n' + rows.join('\n'));
     return;
   }
 
@@ -1103,11 +1743,26 @@ async function handleEvent(event) {
     sections.push(
       [
         'ใช้ได้ทุกคนทุกกลุ่ม:',
+        'แท็กชื่อบอทแล้วพิมพ์คำถามต่อท้าย - ถามคำถามทั่วไปได้เลย (ต้องให้แอดมินตั้งค่า GEMINI_API_KEY ไว้ก่อน)',
         'พิมพ์ /food, /menu, /เมนู หรือ "กินไรดี" ให้บอทสุ่มเมนูอาหารไทย',
         '/ดวง หรือ /ดูดวง - เปิดไพ่ทาโร่จริงดูดวงประจำวัน (รูปไพ่ + คำทำนาย + ข้อควรระวัง + สีมงคล + เลขเด่น 2 ชุด + คนที่ควรเลี่ยงคุยด้วยวันนี้) เปิดได้วันละ 1 ครั้งต่อคน เปลี่ยนใหม่ทุกเที่ยงคืน',
+        '',
+        '🐾 เกมเลี้ยงสัตว์เลี้ยง:',
+        '/รับเลี้ยง <ชื่อ> - รับเลี้ยงสัตว์เลี้ยงของตัวเอง (คนละ 1 ตัว)',
+        '/ให้อาหาร - ดูแลสัตว์เลี้ยง รอบละ +25 คะแนนทันที (เช้า 06:00-12:00 น. / บ่าย 12:01-18:00 น. เท่านั้น)',
+        '/ป้อนยา - รักษาสัตว์เลี้ยงตอนป่วย (ไม่มีตายถาวร หายได้เสมอ)',
+        '/สัตว์เลี้ยง - ดูสถานะสัตว์เลี้ยงของตัวเอง (พลังชีวิตสะสม + ระยะการเติบโต)',
+        '/สัตว์เลี้ยงกลุ่ม - ดูสัตว์เลี้ยงของทุกคนในกลุ่ม',
+        'ดูแลครึ่งวัน (แค่เช้า/แค่บ่าย) ยังได้ +25 เฉยๆ ไม่มีโทษ แต่ถ้าขาดดูแลทั้งวัน (ไม่ป้อนเลย) โดนหักพลังชีวิต -20 ท้ายวัน ขาดติดกัน 2 วันจะป่วยทันที',
+        'ระยะการเติบโต: ไข่ลึกลับ → ลูก(50) → เด็ก(400) → วัยรุ่น(1000) → โตเต็มวัย(2000) → พร้อมสืบพันธุ์(4000) → แก่จัด(7500) → ตำนาน(15000) [ตัวเลข = พลังชีวิตสะสม ไม่มีวันถอยกลับ]',
+        '🎲 บอทจะสุ่ม "เหตุการณ์พิเศษ" push เข้ากลุ่มวันละ 4 รอบ (เวลาสุ่มช่วง 08:30-17:00 น.)',
+        'เป็นข้อความสั้นๆ แบบสุ่ม (เช่น "หิวจัง ขอเพิ่มอีกคำ") ใครในกลุ่มพิมพ์ตามให้ตรงเป๊ะได้ก่อน',
+        'รอบละ 1 นาที 5 คนแรกที่พิมพ์ถูกได้ +30 คะแนน คนที่เหลือได้ +10 คะแนน (ต้องมีสัตว์เลี้ยงก่อนถึงรับได้)',
+        '',
         '/ใคร<คำถาม> เช่น "/ใครหล่อที่สุด" - สุ่มคำตอบเป็นคนในกลุ่ม',
         '/สมาชิก - ดูว่าบอทรู้จักใครในกลุ่มนี้บ้าง (ใช้เป็นคำตอบของ /ใคร ได้)',
         '/groupid - ดู groupId ของกลุ่มนี้',
+        '/backup (หรือ /สำรอง) - เช็คสถานะระบบสำรองข้อมูลอัตโนมัติ กันคะแนน/สัตว์เลี้ยงหายตอน deploy ใหม่หรือรีสตาร์ท',
       ].join('\n')
     );
     await reply(event, sections.join('\n\n'));
@@ -1308,4 +1963,6 @@ app.use((req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('LINE quiz scoreboard bot listening on port ' + PORT));
+dbBackupReady.then(() => {
+  app.listen(PORT, () => console.log('LINE quiz scoreboard bot listening on port ' + PORT));
+});
