@@ -19,6 +19,12 @@ const UPLOAD_PASSCODE = process.env.UPLOAD_PASSCODE || 'changeme123';
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
 const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
 
+// โดเมนสาธารณะของบอทเอง (URL ที่คนทั่วไปเข้าเว็บนี้ได้จริง เช่น https://your-app.up.railway.app)
+// ใช้สร้างลิงก์รูปสัตว์เลี้ยงที่ host เอง (โฟลเดอร์ public/pet-images) เพื่อส่งเป็น LINE image message
+// หา URL จริงได้จากหน้า Settings > Networking ของ service ใน Railway (หรือ URL ของ service บน Render)
+// ถ้าไม่ตั้งค่า ฟีเจอร์ส่งรูปสัตว์เลี้ยงจะปิดอยู่เฉยๆ (บอทยังใช้งานได้ปกติทุกอย่าง แค่ไม่มีรูปแนบ)
+const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || '').trim().replace(/\/+$/, '');
+
 // บอทตัวเดียวกันนี้ใช้ได้หลายกลุ่ม แยกบทบาทกันด้วย groupId
 // ถ้าไม่ตั้งค่า (เว้นว่างไว้) = เปิดใช้งานฟีเจอร์นั้นได้ทุกกลุ่ม (พฤติกรรมเดิม)
 // ถ้าตั้งค่าแล้ว = ฟีเจอร์นั้นจะทำงานเฉพาะกลุ่มที่ระบุ groupId ตรงกันเท่านั้น
@@ -1184,7 +1190,8 @@ async function askGemini(question) {
 // จะโดนหักท้ายวัน -20 แต้ม (พื้นที่ 0 ไม่ติดลบ) ขาดดูแลทั้งวันติดกัน
 // 2 วันขึ้นไปจะป่วยทันที ป้อนยาแล้วหายได้เสมอ (ไม่มีตายถาวร) ระยะการเติบโตไม่มีวันถอยกลับแม้แต้มจะลดลง
 // ภายหลังจากถูกปล่อยละเลย นอกจากนี้บอทจะสุ่ม "เหตุการณ์พิเศษ" push เข้ากลุ่มวันละ 4 รอบ (เวลาสุ่มระหว่าง
-// 08:30-17:00 น.) เป็นเกม "พิมพ์ตามให้ตรงเป๊ะ" เปิดให้ทุกคนในกลุ่มแข่งกัน แต่ละรอบจำกัดเวลา 1 นาที
+// 08:30-17:00 น.) แบ่งครึ่งๆ สุ่มลำดับ เป็น 2 รอบเกม "โจทย์เลขบวกลบ" (เลข 2-3 หลัก พิมพ์คำตอบให้ถูก)
+// กับ 2 รอบเกม "พิมพ์ตามให้ตรงเป๊ะ" เปิดให้ทุกคนในกลุ่มแข่งกัน แต่ละรอบจำกัดเวลา 1 นาที
 // 5 คนแรกที่พิมพ์ถูกได้ +30 แต้ม คนที่เหลือได้ +10 แต้ม แล้วบอทจะแจ้งหมดเวลาเมื่อครบ 1 นาที
 // รวมใช้ประมาณ 240 ข้อความ push/เดือน (แพ็กเกจฟรีของไทยมี 300 ข้อความ/เดือน ยังพอมีเผื่อฟีเจอร์อื่น)
 
@@ -1192,6 +1199,35 @@ const PET_SPECIES = [
   '🐶 หมาน้อย', '🐱 แมวเหมียว', '🐰 กระต่าย', '🐹 แฮมสเตอร์', '🐼 แพนด้า',
   '🐧 เพนกวิน', '🦊 จิ้งจอก', '🐢 เต่า', '🐥 ลูกเจี๊ยบ', '🐸 กบ',
 ];
+
+// จับคู่ชนิดสัตว์ (ข้อความเต็มใน PET_SPECIES) กับชื่อโฟลเดอร์รูปภาพใน public/pet-images/<slug>/<stage>.png
+const PET_SPECIES_SLUG = {
+  '🐶 หมาน้อย': 'dog',
+  '🐱 แมวเหมียว': 'cat',
+  '🐰 กระต่าย': 'rabbit',
+  '🐹 แฮมสเตอร์': 'hamster',
+  '🐼 แพนด้า': 'panda',
+  '🐧 เพนกวิน': 'penguin',
+  '🦊 จิ้งจอก': 'fox',
+  '🐢 เต่า': 'turtle',
+  '🐥 ลูกเจี๊ยบ': 'chick',
+  '🐸 กบ': 'frog',
+};
+
+// สร้าง URL รูปสัตว์เลี้ยงตามชนิด+ระยะการโตปัจจุบัน (คืนค่า null ถ้ายังไม่ได้ตั้งค่า PUBLIC_BASE_URL)
+function petImageUrl(pet) {
+  if (!PUBLIC_BASE_URL) return null;
+  const slug = PET_SPECIES_SLUG[pet.species];
+  if (!slug) return null;
+  return `${PUBLIC_BASE_URL}/pet-images/${slug}/${pet.stage}.png`;
+}
+
+// สร้าง LINE image message จากสัตว์เลี้ยง (คืนค่า null ถ้าไม่มีรูปให้ส่ง เพื่อให้ผู้เรียกข้ามได้ง่ายๆ)
+function petImageMessage(pet) {
+  const url = petImageUrl(pet);
+  if (!url) return null;
+  return { type: 'image', originalContentUrl: url, previewImageUrl: url };
+}
 
 // ลำดับระยะการเติบโต (เรียงจากน้อยไปมาก) ใช้เทียบอันดับเพื่อการันตีว่าสเตจไม่มีวันถอยกลับ
 const PET_STAGE_ORDER = ['egg', 'baby', 'child', 'teen', 'adult', 'breed', 'old', 'legend'];
@@ -1220,12 +1256,15 @@ function petStageFromLifeForce(points) {
 }
 
 // อัปเดต pet.stage เฉพาะตอนที่ระยะใหม่ "สูงกว่า" ระยะเดิมเท่านั้น (การันตีไม่มีวันถอยกลับ
-// แม้ lifeForce จะลดลงภายหลังจากถูกปล่อยละเลย)
+// แม้ lifeForce จะลดลงภายหลังจากถูกปล่อยละเลย) คืนค่า true ถ้ามีการอัปเกรดระยะจริง เพื่อให้ผู้เรียก
+// รู้ว่าควรส่งรูป/ประกาศฉลองการโตขึ้นหรือไม่
 function advancePetStageIfHigher(pet) {
   const candidate = petStageFromLifeForce(pet.lifeForce);
   if (PET_STAGE_ORDER.indexOf(candidate) > PET_STAGE_ORDER.indexOf(pet.stage)) {
     pet.stage = candidate;
+    return true;
   }
+  return false;
 }
 
 function adoptPet(name) {
@@ -1296,8 +1335,8 @@ function feedPet(pet) {
   }
   pet.caredToday[session] = true;
   pet.lifeForce = Math.max(0, pet.lifeForce + 25); // กดป้อนอาหาร ได้ +25 คะแนนทันที ง่ายๆ/รอบ (เช้าหรือบ่าย)
-  advancePetStageIfHigher(pet);
-  return { ok: true, session };
+  const leveledUp = advancePetStageIfHigher(pet);
+  return { ok: true, session, leveledUp };
 }
 
 function givePetMedicine(pet) {
@@ -1330,7 +1369,7 @@ function pickRandomTimeInWindow(dayIndex, startHour, endHour) {
   return startMs + Math.random() * (endMs - startMs);
 }
 
-// ---- เหตุการณ์พิเศษ (สุ่มวันละ 4 รอบ เป็นเกม "พิมพ์ตามให้ตรงเป๊ะ" เปิดให้ทุกคนในกลุ่มแข่งกัน) ----
+// ---- เหตุการณ์พิเศษ (สุ่มวันละ 4 รอบ ครึ่งหนึ่งเป็นโจทย์เลขบวกลบ ครึ่งหนึ่งเป็น "พิมพ์ตามให้ตรงเป๊ะ" เปิดให้ทุกคนในกลุ่มแข่งกัน) ----
 const PET_EVENT_WINDOW_START_HOUR = 8.5; // 08:30 น.
 const PET_EVENT_WINDOW_END_HOUR = 17; // 17:00 น.
 const PET_EVENT_ROUNDS_PER_DAY = 4;
@@ -1379,22 +1418,73 @@ function pickPetEventTimes(dayIndex) {
   return times;
 }
 
-// สุ่มข้อความ 1 อย่าง แล้ว push ชวนทุกคนในกลุ่มแข่งพิมพ์ตามให้ตรงเป๊ะ (จำกัดเวลา 1 นาที เปิดให้ได้หลายคน)
-async function triggerPetEvent() {
+function randInt(min, max) {
+  // สุ่มจำนวนเต็ม รวมค่า min และ max ทั้งคู่
+  return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+
+// สุ่มว่าแต่ละรอบใน 1 วัน (มี PET_EVENT_ROUNDS_PER_DAY รอบ) จะเป็นเกมชนิดไหน แบ่งครึ่งๆ ระหว่าง
+// "โจทย์เลขบวกลบ" กับ "พิมพ์ตามให้ตรงเป๊ะ" (ถ้าจำนวนรอบเป็นเลขคี่ ที่เหลือจะเป็นพิมพ์ตามให้ตรงเป๊ะ)
+// แล้วสลับลำดับให้สุ่มว่าจะเจอโจทย์เลขหรือพิมพ์ตามก่อน ไม่ตายตัว
+function pickDailyRoundKinds(n) {
+  const mathCount = Math.floor(n / 2);
+  const kinds = [];
+  for (let i = 0; i < n; i++) kinds.push(i < mathCount ? 'math' : 'phrase');
+  for (let i = kinds.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [kinds[i], kinds[j]] = [kinds[j], kinds[i]];
+  }
+  return kinds;
+}
+
+// สุ่มโจทย์เลขบวก/ลบ เลข 2-3 หลักทั้งคู่ (10-999) ลบแล้วรับประกันไม่ติดลบ (สลับให้เลขตัวใหญ่ลบก่อนเสมอ)
+function generateMathChallenge() {
+  const digitsA = randInt(2, 3);
+  const digitsB = randInt(2, 3);
+  const a = randInt(Math.pow(10, digitsA - 1), Math.pow(10, digitsA) - 1);
+  const b = randInt(Math.pow(10, digitsB - 1), Math.pow(10, digitsB) - 1);
+  const isAdd = Math.random() < 0.5;
+  if (isAdd) {
+    return { promptText: `${a} + ${b} = เท่าไหร่?`, answerText: String(a + b) };
+  }
+  const big = Math.max(a, b);
+  const small = Math.min(a, b);
+  return { promptText: `${big} - ${small} = เท่าไหร่?`, answerText: String(big - small) };
+}
+
+// เริ่มเหตุการณ์พิเศษรอบหนึ่ง (roundIndex = รอบที่เท่าไหร่ของวันนี้ ใช้เลือกชนิดเกมจาก db.petSchedule.kinds)
+// เป็นได้ 2 แบบ: "math" (โจทย์เลขบวกลบ พิมพ์คำตอบให้ถูก) หรือ "phrase" (สุ่มข้อความ พิมพ์ตามให้ตรงเป๊ะ)
+// เงื่อนไขรับรางวัลเหมือนกันทั้ง 2 แบบ (จำกัดเวลา 1 นาที เปิดให้ได้หลายคน)
+async function triggerPetEvent(roundIndex) {
   if (!db.groupId || !db.pets) return;
   if (Object.keys(db.pets).length === 0) return; // ยังไม่มีใครเลี้ยงสัตว์เลี้ยงเลยในกลุ่มนี้ ไม่ต้องส่ง
-  const kinds = Object.keys(PET_EVENT_HOOKS);
-  const kind = kinds[Math.floor(Math.random() * kinds.length)];
-  const hooks = PET_EVENT_HOOKS[kind];
-  const hookText = hooks[Math.floor(Math.random() * hooks.length)];
-  db.petChallenge = { hookText, kind, startedAt: Date.now(), winners: [], timeUpAnnounced: false };
+  const roundKind =
+    (db.petSchedule && Array.isArray(db.petSchedule.kinds) && db.petSchedule.kinds[roundIndex]) || 'phrase';
+
+  let text;
+  if (roundKind === 'math') {
+    const { promptText, answerText } = generateMathChallenge();
+    db.petChallenge = { hookText: answerText, kind: 'math', promptText, startedAt: Date.now(), winners: [], timeUpAnnounced: false };
+    text = [
+      '🔢 โจทย์เลขด่วน! ใครคิดเลขไวที่สุด...',
+      promptText,
+      `พิมพ์คำตอบ (ตัวเลขล้วนๆ) ให้ถูกเป็นคนแรกๆ ภายใน 1 นาที! ${PET_CHALLENGE_TOP_SLOTS} คนแรกได้ +${PET_CHALLENGE_TOP_POINTS} คะแนน คนที่เหลือได้ +${PET_CHALLENGE_REST_POINTS} คะแนน`,
+      '(ต้องมีสัตว์เลี้ยงของตัวเองก่อนถึงจะรับรางวัลได้ — หมดเวลา 1 นาทีแล้วพิมพ์ถูกจะไม่ได้คะแนนนะ)',
+    ].join('\n');
+  } else {
+    const kinds = Object.keys(PET_EVENT_HOOKS);
+    const kind = kinds[Math.floor(Math.random() * kinds.length)];
+    const hooks = PET_EVENT_HOOKS[kind];
+    const hookText = hooks[Math.floor(Math.random() * hooks.length)];
+    db.petChallenge = { hookText, kind, promptText: hookText, startedAt: Date.now(), winners: [], timeUpAnnounced: false };
+    text = [
+      '🎲 เหตุการณ์พิเศษ! มีเสียงจากสัตว์เลี้ยงในกลุ่มดังขึ้นว่า...',
+      `"${hookText}"`,
+      `ใครพิมพ์ข้อความนี้ตามให้ตรงเป๊ะได้ก่อน ภายใน 1 นาที! ${PET_CHALLENGE_TOP_SLOTS} คนแรกได้ +${PET_CHALLENGE_TOP_POINTS} คะแนน คนที่เหลือได้ +${PET_CHALLENGE_REST_POINTS} คะแนน`,
+      '(ต้องมีสัตว์เลี้ยงของตัวเองก่อนถึงจะรับรางวัลได้ — หมดเวลา 1 นาทีแล้วพิมพ์ถูกจะไม่ได้คะแนนนะ)',
+    ].join('\n');
+  }
   saveDB(db);
-  const text = [
-    '🎲 เหตุการณ์พิเศษ! มีเสียงจากสัตว์เลี้ยงในกลุ่มดังขึ้นว่า...',
-    `"${hookText}"`,
-    `ใครพิมพ์ข้อความนี้ตามให้ตรงเป๊ะได้ก่อน ภายใน 1 นาที! ${PET_CHALLENGE_TOP_SLOTS} คนแรกได้ +${PET_CHALLENGE_TOP_POINTS} คะแนน คนที่เหลือได้ +${PET_CHALLENGE_REST_POINTS} คะแนน`,
-    '(ต้องมีสัตว์เลี้ยงของตัวเองก่อนถึงจะรับรางวัลได้ — หมดเวลา 1 นาทีแล้วพิมพ์ถูกจะไม่ได้คะแนนนะ)',
-  ].join('\n');
   try {
     await client.pushMessage(db.groupId, { type: 'text', text });
   } catch (e) {
@@ -1418,8 +1508,8 @@ function tryClaimPetChallenge(userId, rawText) {
   const pet = db.pets[userId];
   advancePetDays(pet);
   pet.lifeForce = Math.max(0, pet.lifeForce + points);
-  advancePetStageIfHigher(pet);
-  return { points, rank: rank + 1, pet };
+  const leveledUp = advancePetStageIfHigher(pet);
+  return { points, rank: rank + 1, pet, leveledUp };
 }
 
 // เช็คว่ารอบเหตุการณ์พิเศษที่ค้างอยู่ครบ 1 นาทีหรือยัง ถ้าครบแล้วยังไม่ได้แจ้ง ให้ push บอกหมดเวลา
@@ -1429,10 +1519,15 @@ async function checkPetChallengeExpiry() {
   if (Date.now() - ch.startedAt < PET_CHALLENGE_ROUND_MS) return;
   ch.timeUpAnnounced = true;
   saveDB(db);
-  const text =
-    ch.winners.length > 0
-      ? `⏰ หมดเวลารอบพิเศษแล้วครับ! รอบนี้มีคนพิมพ์ถูกทันเวลาทั้งหมด ${ch.winners.length} คน 🎉`
-      : '⏰ หมดเวลารอบพิเศษแล้วครับ ไม่มีใครพิมพ์ถูกทันเลย รอบหน้ามาลองใหม่นะ!';
+  let text;
+  if (ch.winners.length > 0) {
+    text = `⏰ หมดเวลารอบพิเศษแล้วครับ! รอบนี้มีคนพิมพ์ถูกทันเวลาทั้งหมด ${ch.winners.length} คน 🎉`;
+  } else if (ch.kind === 'math') {
+    // โจทย์เลขไม่มีใครเห็นคำตอบมาก่อน (ไม่เหมือนโจทย์พิมพ์ตามที่เฉลยอยู่ในตัวข้อความอยู่แล้ว) เลยเฉลยให้ตอนหมดเวลา
+    text = `⏰ หมดเวลารอบพิเศษแล้วครับ ไม่มีใครตอบถูกเลย เฉลยคือ ${ch.hookText} รอบหน้ามาลองใหม่นะ!`;
+  } else {
+    text = '⏰ หมดเวลารอบพิเศษแล้วครับ ไม่มีใครพิมพ์ถูกทันเลย รอบหน้ามาลองใหม่นะ!';
+  }
   try {
     await client.pushMessage(db.groupId, { type: 'text', text });
   } catch (e) {
@@ -1448,6 +1543,7 @@ async function petSchedulerTick() {
     db.petSchedule = {
       dayIndex,
       times: pickPetEventTimes(dayIndex),
+      kinds: pickDailyRoundKinds(PET_EVENT_ROUNDS_PER_DAY), // ครึ่งนึงโจทย์เลข ครึ่งนึงพิมพ์ตาม สุ่มลำดับ
       sent: new Array(PET_EVENT_ROUNDS_PER_DAY).fill(false),
     };
     saveDB(db);
@@ -1457,7 +1553,7 @@ async function petSchedulerTick() {
     if (!db.petSchedule.sent[i] && now >= db.petSchedule.times[i]) {
       db.petSchedule.sent[i] = true;
       saveDB(db);
-      await triggerPetEvent();
+      await triggerPetEvent(i);
     }
   }
   await checkPetChallengeExpiry();
@@ -1495,10 +1591,17 @@ async function handleEvent(event) {
     }
     saveDB(db);
     const winnerName = (db.groupMembers && db.groupMembers[groupId] && db.groupMembers[groupId][userId]) || 'คุณ';
-    await reply(
-      event,
-      `✅ ${winnerName} พิมพ์ถูกเป็นคนที่ ${petClaim.rank}! ${petClaim.pet.species} "${petClaim.pet.name}" ได้พลังชีวิต +${petClaim.points} คะแนน (สะสม ${petClaim.pet.lifeForce})`
-    );
+    const claimText =
+      `✅ ${winnerName} พิมพ์ถูกเป็นคนที่ ${petClaim.rank}! ${petClaim.pet.species} "${petClaim.pet.name}" ได้พลังชีวิต +${petClaim.points} คะแนน (สะสม ${petClaim.pet.lifeForce})` +
+      (petClaim.leveledUp ? `\n🎉 โตขึ้นเป็นระยะ "${PET_STAGE_LABEL[petClaim.pet.stage]}" แล้ว!` : '');
+    if (petClaim.leveledUp) {
+      const img = petImageMessage(petClaim.pet);
+      if (img) {
+        await replyMessages(event, [img, { type: 'text', text: claimText }]);
+        return;
+      }
+    }
+    await reply(event, claimText);
     return;
   }
 
@@ -1615,12 +1718,16 @@ async function handleEvent(event) {
     }
     db.pets[userId] = adoptPet(name);
     saveDB(db);
-    await reply(
-      event,
+    const adoptText =
       `🎉 ยินดีด้วย! คุณได้รับเลี้ยง ${db.pets[userId].species} ชื่อ "${name}" แล้ว\n` +
-        'ตอนนี้ยังเป็นไข่ลึกลับอยู่ ดูแลให้ครบทุกวัน (เช้า+บ่าย) เดี๋ยวจะฟักออกมาเอง แล้วค่อยๆ โตขึ้นเรื่อยๆ\n' +
-        'พิมพ์ /ให้อาหาร ตอนบอทเตือน หรือเมื่อไหร่ก็ได้ที่นึกขึ้นได้ครับ (พิมพ์ /สัตว์เลี้ยง เพื่อดูสถานะได้ตลอด)'
-    );
+      'ตอนนี้ยังเป็นไข่ลึกลับอยู่ ดูแลให้ครบทุกวัน (เช้า+บ่าย) เดี๋ยวจะฟักออกมาเอง แล้วค่อยๆ โตขึ้นเรื่อยๆ\n' +
+      'พิมพ์ /ให้อาหาร ตอนบอทเตือน หรือเมื่อไหร่ก็ได้ที่นึกขึ้นได้ครับ (พิมพ์ /สัตว์เลี้ยง เพื่อดูสถานะได้ตลอด)';
+    const adoptImg = petImageMessage(db.pets[userId]);
+    if (adoptImg) {
+      await replyMessages(event, [adoptImg, { type: 'text', text: adoptText }]);
+      return;
+    }
+    await reply(event, adoptText);
     return;
   }
 
@@ -1646,10 +1753,17 @@ async function handleEvent(event) {
       return;
     }
     const sessionLabel = result.session === 'morning' ? 'ช่วงเช้า' : 'ช่วงบ่าย';
-    await reply(
-      event,
-      `🍚 ป้อนอาหาร${sessionLabel}ให้ ${pet.species} "${pet.name}" เรียบร้อย! ได้พลังชีวิต +25 คะแนน (สะสม ${pet.lifeForce})${pet.sick ? ' (แต่ยังป่วยอยู่ อย่าลืม /ป้อนยา ด้วยนะ)' : ' 😊'}`
-    );
+    const feedText =
+      `🍚 ป้อนอาหาร${sessionLabel}ให้ ${pet.species} "${pet.name}" เรียบร้อย! ได้พลังชีวิต +25 คะแนน (สะสม ${pet.lifeForce})${pet.sick ? ' (แต่ยังป่วยอยู่ อย่าลืม /ป้อนยา ด้วยนะ)' : ' 😊'}` +
+      (result.leveledUp ? `\n🎉 ${pet.species} "${pet.name}" โตขึ้นเป็นระยะ "${PET_STAGE_LABEL[pet.stage]}" แล้ว!` : '');
+    if (result.leveledUp) {
+      const img = petImageMessage(pet);
+      if (img) {
+        await replyMessages(event, [img, { type: 'text', text: feedText }]);
+        return;
+      }
+    }
+    await reply(event, feedText);
     return;
   }
 
@@ -1677,6 +1791,11 @@ async function handleEvent(event) {
     const pet = db.pets[userId];
     advancePetDays(pet);
     saveDB(db);
+    const statusImg = petImageMessage(pet);
+    if (statusImg) {
+      await replyMessages(event, [statusImg, { type: 'text', text: formatPetStatus(pet) }]);
+      return;
+    }
     await reply(event, formatPetStatus(pet));
     return;
   }
@@ -1756,8 +1875,9 @@ async function handleEvent(event) {
         'ดูแลครึ่งวัน (แค่เช้า/แค่บ่าย) ยังได้ +25 เฉยๆ ไม่มีโทษ แต่ถ้าขาดดูแลทั้งวัน (ไม่ป้อนเลย) โดนหักพลังชีวิต -20 ท้ายวัน ขาดติดกัน 2 วันจะป่วยทันที',
         'ระยะการเติบโต: ไข่ลึกลับ → ลูก(50) → เด็ก(400) → วัยรุ่น(1000) → โตเต็มวัย(2000) → พร้อมสืบพันธุ์(4000) → แก่จัด(7500) → ตำนาน(15000) [ตัวเลข = พลังชีวิตสะสม ไม่มีวันถอยกลับ]',
         '🎲 บอทจะสุ่ม "เหตุการณ์พิเศษ" push เข้ากลุ่มวันละ 4 รอบ (เวลาสุ่มช่วง 08:30-17:00 น.)',
-        'เป็นข้อความสั้นๆ แบบสุ่ม (เช่น "หิวจัง ขอเพิ่มอีกคำ") ใครในกลุ่มพิมพ์ตามให้ตรงเป๊ะได้ก่อน',
-        'รอบละ 1 นาที 5 คนแรกที่พิมพ์ถูกได้ +30 คะแนน คนที่เหลือได้ +10 คะแนน (ต้องมีสัตว์เลี้ยงก่อนถึงรับได้)',
+        'ครึ่งหนึ่ง (2 รอบ) เป็นโจทย์เลขบวก/ลบ 2-3 หลัก พิมพ์คำตอบให้ถูก, อีกครึ่ง (2 รอบ) เป็นข้อความสั้นๆ แบบสุ่ม ให้พิมพ์ตามให้ตรงเป๊ะ (สุ่มลำดับว่าจะเจอแบบไหนก่อน)',
+        'รอบละ 1 นาที 5 คนแรกที่ตอบถูกได้ +30 คะแนน คนที่เหลือได้ +10 คะแนน (ต้องมีสัตว์เลี้ยงก่อนถึงรับได้)',
+        '🎨 มีรูปสัตว์เลี้ยงน่ารักๆ แนบให้อัตโนมัติตอนรับเลี้ยง/เช็คสถานะ/โตขึ้นเป็นระยะใหม่',
         '',
         '/ใคร<คำถาม> เช่น "/ใครหล่อที่สุด" - สุ่มคำตอบเป็นคนในกลุ่ม',
         '/สมาชิก - ดูว่าบอทรู้จักใครในกลุ่มนี้บ้าง (ใช้เป็นคำตอบของ /ใคร ได้)',
