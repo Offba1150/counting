@@ -1563,8 +1563,146 @@ setInterval(() => {
 }, 60 * 1000);
 // ==== จบส่วนเกมเลี้ยงสัตว์เลี้ยง ======================================================
 
+// ==== ฟีเจอร์บ่นแบบไม่ระบุตัวตน ========================================================
+// ต้องทักบอทแบบส่วนตัว (1:1) เท่านั้น ห้ามพิมพ์ในกลุ่ม เพราะถ้าพิมพ์ในกลุ่มสมาชิกคนอื่นจะเห็น
+// ชื่อ/รูปคนพิมพ์จาก LINE เองอยู่แล้วตั้งแต่ข้อความขึ้น ต่อให้บอทไม่บอกชื่อก็ไม่ช่วยอะไร
+// ข้อความที่บ่นเข้ามาจะถูกเก็บไว้ก่อน (db.pendingVents) แล้วค่อยรวมส่งเป็น push message เดียว
+// วันละ 1 รอบตอน 16:30 น. (เวลาไทย) เพื่อประหยัดโควต้า push message รายเดือนของ LINE OA
+// (ถ้า push ทันทีทุกครั้งที่มีคนบ่น จะกินโควต้าเยอะมาก เพราะข้ามจากแชทส่วนตัวไปกลุ่มต้องใช้ push เสมอ)
+const VENT_COOLDOWN_MS = 60 * 1000; // กันสแปม พิมพ์ได้คนละ 1 ครั้งต่อ 1 นาที
+const VENT_MAX_LENGTH = 500;
+const VENT_MAX_PER_DAY = 50; // กันคิวยาวเกินไปจนข้อความสรุปยาวเกินลิมิตของ LINE (ข้อความละไม่เกิน 5000 ตัวอักษร)
+const VENT_BATCH_HOUR = 16;
+const VENT_BATCH_MINUTE = 30;
+const VENT_OPEN_HOUR = 9;    // เปิดรับบ่นตั้งแต่ 9:00 น.
+const VENT_CLOSE_HOUR = 16;  // ปิดรับบ่นตอน 16:15 น. (เผื่อเวลา 15 นาทีก่อนถึงรอบสรุป 16:30 น.)
+const VENT_CLOSE_MINUTE = 15;
+const VENT_HOURS_LABEL = `${VENT_OPEN_HOUR}:00-${VENT_CLOSE_HOUR}:${String(VENT_CLOSE_MINUTE).padStart(2, '0')} น.`;
+
+// เช็คว่าตอนนี้อยู่ในช่วงเวลาที่เปิดรับบ่นไหม (เวลาไทย) - นอกช่วงนี้ยังทักบอทได้ปกติ แค่ไม่รับบ่น
+function isVentOpenNow() {
+  const bkk = bangkokNow();
+  const hour = bkk.getUTCHours() + bkk.getUTCMinutes() / 60;
+  const closeHour = VENT_CLOSE_HOUR + VENT_CLOSE_MINUTE / 60;
+  return hour >= VENT_OPEN_HOUR && hour < closeHour;
+}
+
+async function handleAnonymousVent(event) {
+  const userId = event.source.userId;
+  const text = (event.message.text || '').trim();
+  const ventMatch = text.match(/^\/(บ่น|ระบาย)\s*([\s\S]*)$/i);
+  if (!ventMatch) {
+    await reply(
+      event,
+      `👋 ทักส่วนตัวมาที่นี่ได้เลยครับ พิมพ์ "/บ่น <ข้อความ>" ช่วงเวลา ${VENT_HOURS_LABEL} แล้วบอทจะเก็บไว้ก่อน แล้วรวมโพสต์เข้ากลุ่มให้วันละ 1 รอบตอน ${VENT_BATCH_HOUR}:${String(VENT_BATCH_MINUTE).padStart(2, '0')} น. โดยไม่บอกใครเลยว่าเป็นคุณพิมพ์`
+    );
+    return;
+  }
+  if (!isVentOpenNow()) {
+    await reply(event, `ตอนนี้ยังไม่เปิดให้บ่นครับ เปิดรับข้อความช่วง ${VENT_HOURS_LABEL} เท่านั้น ลองใหม่ในช่วงเวลานี้นะ`);
+    return;
+  }
+  const message = ventMatch[2].trim();
+  if (!message) {
+    await reply(event, 'พิมพ์ข้อความที่อยากบ่นต่อท้ายด้วยครับ เช่น "/บ่น วันนี้เหนื่อยมากเลย"');
+    return;
+  }
+  if (message.length > VENT_MAX_LENGTH) {
+    await reply(event, `ข้อความยาวไปหน่อยครับ (${message.length} ตัวอักษร) ขอไม่เกิน ${VENT_MAX_LENGTH} ตัวอักษรนะ`);
+    return;
+  }
+  if (!db.groupId) {
+    await reply(event, 'บอทยังไม่รู้จักกลุ่มที่จะโพสต์ให้เลยครับ (ต้องมีคนพิมพ์อะไรสักอย่างในกลุ่มไลน์ก่อนสักครั้ง บอทถึงจะจำกลุ่มได้)');
+    return;
+  }
+
+  if (!db.ventCooldown) db.ventCooldown = {};
+  const lastVentAt = db.ventCooldown[userId] || 0;
+  const now = Date.now();
+  if (now - lastVentAt < VENT_COOLDOWN_MS) {
+    const waitSec = Math.ceil((VENT_COOLDOWN_MS - (now - lastVentAt)) / 1000);
+    await reply(event, `พิมพ์ถี่ไปหน่อยครับ รออีก ${waitSec} วินาทีแล้วค่อยบ่นใหม่นะ`);
+    return;
+  }
+
+  if (!db.pendingVents) db.pendingVents = [];
+  if (db.pendingVents.length >= VENT_MAX_PER_DAY) {
+    await reply(event, `วันนี้มีคนบ่นเข้ามาเต็มโควต้าแล้วครับ (${VENT_MAX_PER_DAY} ข้อความ) ลองใหม่พรุ่งนี้นะ`);
+    return;
+  }
+
+  db.ventCooldown[userId] = now;
+  db.pendingVents.push({ text: message, at: now });
+  saveDB(db);
+
+  await reply(
+    event,
+    `✅ บันทึกไว้แล้วครับ ไม่มีใครรู้ว่าเป็นคุณแน่นอน 🤫 จะรวมโพสต์เข้ากลุ่มพร้อมข้อความอื่นๆ ตอน ${VENT_BATCH_HOUR}:${String(VENT_BATCH_MINUTE).padStart(2, '0')} น. วันนี้ครับ`
+  );
+}
+
+// รวมข้อความที่บ่นค้างไว้ทั้งหมด ตัดเป็นชุดๆ ไม่ให้เกิน 4500 ตัวอักษร/ข้อความ (limit จริงของ LINE คือ 5000)
+function buildVentBatchMessages(pendingVents) {
+  const CHUNK_LIMIT = 4500;
+  const lines = pendingVents.map((v, i) => `${i + 1}) ${v.text}`);
+  const chunks = [];
+  let current = '';
+  for (const line of lines) {
+    const candidate = current ? `${current}\n${line}` : line;
+    if (candidate.length > CHUNK_LIMIT && current) {
+      chunks.push(current);
+      current = line;
+    } else {
+      current = candidate;
+    }
+  }
+  if (current) chunks.push(current);
+  return chunks.map((chunk, idx) => ({
+    type: 'text',
+    text: `🙊 สรุปข้อความบ่นแบบไม่ระบุตัวตนวันนี้${chunks.length > 1 ? ` (${idx + 1}/${chunks.length})` : ''}:\n\n${chunk}`,
+  }));
+}
+
+// เช็คทุกนาที ถ้าถึงเวลารอบสรุป (VENT_BATCH_HOUR:VENT_BATCH_MINUTE เวลาไทย) และยังไม่ได้ส่งของวันนี้ -> ส่ง
+async function ventBatchTick() {
+  if (!db.groupId) return;
+  const bkk = bangkokNow();
+  const hour = bkk.getUTCHours();
+  const minute = bkk.getUTCMinutes();
+  if (hour !== VENT_BATCH_HOUR || minute !== VENT_BATCH_MINUTE) return;
+
+  const today = todayKeyBangkok();
+  if (db.lastVentBatchDate === today) return; // ส่งไปแล้ววันนี้ กันส่งซ้ำ
+  db.lastVentBatchDate = today;
+
+  const pendingVents = db.pendingVents || [];
+  db.pendingVents = [];
+  saveDB(db);
+
+  if (pendingVents.length === 0) return; // วันนี้ไม่มีใครบ่นเลย ไม่ต้อง push อะไร
+
+  const messages = buildVentBatchMessages(pendingVents);
+  for (const msg of messages) {
+    try {
+      await client.pushMessage(db.groupId, msg);
+    } catch (e) {
+      console.error('vent batch push failed:', e.originalError?.response?.data || e.message);
+    }
+  }
+}
+setInterval(() => {
+  ventBatchTick().catch((e) => console.error('ventBatchTick error:', e.message));
+}, 60 * 1000);
+
 async function handleEvent(event) {
   if (event.type !== 'message' || event.message.type !== 'text') return;
+
+  // ทักบอทแบบส่วนตัว (1:1) - ใช้ได้เฉพาะฟีเจอร์บ่นแบบไม่ระบุตัวตนเท่านั้น คำสั่งอื่นๆ ใช้ในกลุ่มเท่านั้น
+  if (event.source.type === 'user') {
+    await handleAnonymousVent(event);
+    return;
+  }
+
   if (event.source.type !== 'group') return; // ใช้งานเฉพาะในกลุ่มไลน์ปกติเท่านั้น
 
   const groupId = event.source.groupId;
@@ -1883,6 +2021,8 @@ async function handleEvent(event) {
         '/สมาชิก - ดูว่าบอทรู้จักใครในกลุ่มนี้บ้าง (ใช้เป็นคำตอบของ /ใคร ได้)',
         '/groupid - ดู groupId ของกลุ่มนี้',
         '/backup (หรือ /สำรอง) - เช็คสถานะระบบสำรองข้อมูลอัตโนมัติ กันคะแนน/สัตว์เลี้ยงหายตอน deploy ใหม่หรือรีสตาร์ท',
+        '',
+        '🙊 บ่นแบบไม่ระบุตัวตน: ทักบอทแบบส่วนตัว (ไม่ใช่พิมพ์ในกลุ่มนี้) ช่วงเวลา 9:00-16:15 น. แล้วพิมพ์ "/บ่น <ข้อความ>" บอทจะเก็บไว้ก่อน แล้วรวมโพสต์เข้ากลุ่มให้วันละ 1 รอบตอน 16:30 น. โดยไม่บอกว่าใครพิมพ์ (พิมพ์คนละ 1 ครั้งต่อ 1 นาที)',
       ].join('\n')
     );
     await reply(event, sections.join('\n\n'));
